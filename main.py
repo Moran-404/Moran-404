@@ -252,7 +252,7 @@ class LoginDialog(QDialog):
         self.webengine_view_class = load_webengine_view_class()
 
         self.tabs = QTabWidget(self)
-        self.tip_label = QLabel("在当前标签页登录后，点击“导出当前平台 Cookies”保存授权信息。")
+        self.tip_label = QLabel("可优先在内嵌页登录；若页面异常，可点“系统浏览器登录当前平台”并导入 Cookie 文件。")
 
         if self.webengine_view_class:
             self._build_embedded_tabs()
@@ -260,11 +260,13 @@ class LoginDialog(QDialog):
             self._build_fallback_tabs()
 
         self.export_button = QPushButton("导出当前平台 Cookies")
+        self.open_browser_button = QPushButton("系统浏览器登录当前平台")
         self.import_button = QPushButton("导入已有 Cookie 文件")
         self.close_button = QPushButton("关闭")
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.export_button)
+        button_layout.addWidget(self.open_browser_button)
         button_layout.addWidget(self.import_button)
         button_layout.addStretch(1)
         button_layout.addWidget(self.close_button)
@@ -275,22 +277,40 @@ class LoginDialog(QDialog):
         layout.addLayout(button_layout)
 
         self.export_button.clicked.connect(self.export_current_cookies)
+        self.open_browser_button.clicked.connect(self.open_current_platform_in_browser)
         self.import_button.clicked.connect(self.import_cookie_file)
         self.close_button.clicked.connect(self.accept)
 
     def _build_embedded_tabs(self) -> None:
-        for platform, conf in PLATFORMS.items():
-            view = self.webengine_view_class(self)
-            view.setUrl(QUrl(conf["login_url"]))
-            self.tabs.addTab(view, platform)
+        try:
+            for platform, conf in PLATFORMS.items():
+                view = self.webengine_view_class(self)
+                if hasattr(view, "settings"):
+                    settings = view.settings()
+                    web_attrs = [
+                        "JavascriptEnabled",
+                        "LocalStorageEnabled",
+                        "PluginsEnabled",
+                        "FullScreenSupportEnabled",
+                    ]
+                    for attr_name in web_attrs:
+                        if hasattr(settings, attr_name):
+                            settings.setAttribute(getattr(settings, attr_name), True)
 
-            store = view.page().profile().cookieStore()
-            store.cookieAdded.connect(lambda cookie, p=platform: self._cache_cookie(p, cookie))
-            store.loadAllCookies()
+                view.setUrl(QUrl(conf["login_url"]))
+                self.tabs.addTab(view, platform)
+
+                store = view.page().profile().cookieStore()
+                store.cookieAdded.connect(lambda cookie, p=platform: self._cache_cookie(p, cookie))
+                store.loadAllCookies()
+        except Exception:  # noqa: BLE001
+            self.tabs.clear()
+            self.webengine_view_class = None
+            self._build_fallback_tabs()
 
     def _build_fallback_tabs(self) -> None:
         self.tip_label.setText(
-            "当前环境未安装 PyQtWebEngine，无法内嵌登录。可点按钮在系统浏览器登录后，导入 Cookie 文件。"
+            "当前环境无法使用内嵌 WebEngine。请在系统浏览器登录后，导入 Cookie 文件。"
         )
         for platform, conf in PLATFORMS.items():
             page = QWidget(self)
@@ -309,6 +329,19 @@ class LoginDialog(QDialog):
 
         QDesktopServices.openUrl(QUrl(url))
 
+    def open_current_platform_in_browser(self) -> None:
+        platform = self.tabs.tabText(self.tabs.currentIndex())
+        login_url = PLATFORMS.get(platform, {}).get("login_url")
+        if not login_url:
+            QMessageBox.warning(self, "提示", "未找到当前平台登录地址")
+            return
+        self._open_url(login_url)
+        QMessageBox.information(
+            self,
+            "提示",
+            "已在系统浏览器打开登录页。登录完成后，请回到应用点击“导入已有 Cookie 文件”。",
+        )
+
     def _cache_cookie(self, platform: str, cookie: QNetworkCookie) -> None:
         target = self.cookie_cache[platform]
         for idx, current in enumerate(target):
@@ -319,7 +352,7 @@ class LoginDialog(QDialog):
 
     def export_current_cookies(self) -> None:
         if not self.webengine_view_class:
-            QMessageBox.information(self, "提示", "当前环境没有 WebEngine，请使用“导入已有 Cookie 文件”")
+            QMessageBox.information(self, "提示", "当前环境无法使用内嵌 WebEngine，请使用“系统浏览器登录当前平台”+“导入已有 Cookie 文件”")
             return
 
         platform = self.tabs.tabText(self.tabs.currentIndex())
