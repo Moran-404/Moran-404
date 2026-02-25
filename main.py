@@ -1,175 +1,410 @@
+import os
 import sys
-from PyQt5.QtCore import Qt, QUrl
+import tempfile
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
+from PyQt5.QtNetwork import QNetworkCookie
 from PyQt5.QtWidgets import (
     QApplication,
-    QFileDialog,
+    QCheckBox,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMainWindow,
     QMessageBox,
     QPushButton,
     QSlider,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+
+import yt_dlp
 
 
-class OnlineMusicPlayer(QWidget):
-    def __init__(self) -> None:
+PLATFORMS = {
+    "网易云": {
+        "domain": "music.163.com",
+        "search_hint": "site:music.163.com",
+        "login_url": "https://music.163.com/#/login",
+    },
+    "酷狗": {
+        "domain": "kugou.com",
+        "search_hint": "site:kugou.com/song",
+        "login_url": "https://www.kugou.com/",
+    },
+    "酷我": {
+        "domain": "kuwo.cn",
+        "search_hint": "site:kuwo.cn/play_detail",
+        "login_url": "https://www.kuwo.cn/",
+    },
+    "Bilibili": {
+        "domain": "bilibili.com",
+        "search_hint": "site:bilibili.com/video",
+        "login_url": "https://www.bilibili.com/",
+    },
+}
+
+
+@dataclass
+class TrackResult:
+    platform: str
+    title: str
+    artist: str
+    duration: str
+    webpage_url: str
+
+
+class SearchWorker(QThread):
+    finished = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, keyword: str, platforms: List[str]) -> None:
         super().__init__()
-        self.setWindowTitle("PyQt5 在线音乐播放器")
-        self.resize(720, 420)
+        self.keyword = keyword
+        self.platforms = platforms
 
-        self.player = QMediaPlayer(self)
-        self.tracks: list[tuple[str, str]] = []
+    def run(self) -> None:
+        merged: List[TrackResult] = []
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "extract_flat": True,
+            "default_search": "ytsearch",
+            "noplaylist": True,
+        }
 
-        self.url_input = QLineEdit(self)
-        self.url_input.setPlaceholderText("输入音频 URL（如 https://...mp3）")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                for platform in self.platforms:
+                    hint = PLATFORMS[platform]["search_hint"]
+                    domain = PLATFORMS[platform]["domain"]
+                    query = f"ytsearch12:{self.keyword} {hint}"
+                    info = ydl.extract_info(query, download=False)
+                    entries = info.get("entries", []) if info else []
+                    count = 0
+                    for entry in entries:
+                        url = entry.get("webpage_url") or entry.get("url") or ""
+                        if domain not in url:
+                            continue
+                        duration_sec = entry.get("duration")
+                        duration = (
+                            f"{duration_sec // 60:02d}:{duration_sec % 60:02d}"
+                            if isinstance(duration_sec, int)
+                            else "--:--"
+                        )
+                        merged.append(
+                            TrackResult(
+                                platform=platform,
+                                title=entry.get("title") or "未知标题",
+                                artist=entry.get("uploader") or entry.get("channel") or "未知作者",
+                                duration=duration,
+                                webpage_url=url,
+                            )
+                        )
+                        count += 1
+                        if count >= 5:
+                            break
+            self.finished.emit(merged)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
 
-        self.name_input = QLineEdit(self)
-        self.name_input.setPlaceholderText("歌曲名称（可选）")
 
-        self.add_button = QPushButton("添加到播放列表", self)
-        self.play_button = QPushButton("播放", self)
-        self.pause_button = QPushButton("暂停", self)
-        self.stop_button = QPushButton("停止", self)
-        self.delete_button = QPushButton("删除选中", self)
-        self.local_button = QPushButton("导入本地文件", self)
+class ResolveWorker(QThread):
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
 
-        self.list_widget = QListWidget(self)
-        self.status_label = QLabel("状态：就绪", self)
+    def __init__(self, track: TrackResult, cookie_file: Optional[str]) -> None:
+        super().__init__()
+        self.track = track
+        self.cookie_file = cookie_file
 
-        self.position_slider = QSlider(self)
-        self.position_slider.setOrientation(Qt.Horizontal)
-        self.position_slider.setRange(0, 0)
+    def run(self) -> None:
+        options = {
+            "quiet": True,
+            "skip_download": True,
+            "format": "bestaudio/best",
+            "noplaylist": True,
+        }
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            options["cookiefile"] = self.cookie_file
 
-        self._setup_ui()
-        self._connect_signals()
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(self.track.webpage_url, download=False)
+                stream_url = info.get("url")
+                if not stream_url:
+                    raise RuntimeError("未解析到可播放音频地址")
+                self.finished.emit(stream_url)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
 
-    def _setup_ui(self) -> None:
-        input_layout = QHBoxLayout()
-        input_layout.addWidget(self.url_input, 3)
-        input_layout.addWidget(self.name_input, 2)
-        input_layout.addWidget(self.add_button, 1)
 
-        control_layout = QHBoxLayout()
-        for button in [
-            self.play_button,
-            self.pause_button,
-            self.stop_button,
-            self.delete_button,
-            self.local_button,
-        ]:
-            control_layout.addWidget(button)
+class LoginDialog(QDialog):
+    cookies_exported = pyqtSignal(str, str)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("平台登录")
+        self.resize(980, 700)
+        self.cookie_cache: Dict[str, List[QNetworkCookie]] = {name: [] for name in PLATFORMS}
+
+        self.tabs = QTabWidget(self)
+        self.views: Dict[str, QWebEngineView] = {}
+
+        for platform, conf in PLATFORMS.items():
+            view = QWebEngineView(self)
+            view.setUrl(QUrl(conf["login_url"]))
+            self.views[platform] = view
+            self.tabs.addTab(view, platform)
+
+            store = view.page().profile().cookieStore()
+            store.cookieAdded.connect(lambda cookie, p=platform: self._cache_cookie(p, cookie))
+            store.loadAllCookies()
+
+        self.tip_label = QLabel("在当前标签页登录后，点击“导出当前平台 Cookies”保存授权信息。")
+        self.export_button = QPushButton("导出当前平台 Cookies")
+        self.close_button = QPushButton("关闭")
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.export_button)
+        button_layout.addStretch(1)
+        button_layout.addWidget(self.close_button)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(input_layout)
-        layout.addWidget(self.list_widget)
-        layout.addWidget(self.position_slider)
-        layout.addLayout(control_layout)
-        layout.addWidget(self.status_label)
+        layout.addWidget(self.tip_label)
+        layout.addWidget(self.tabs)
+        layout.addLayout(button_layout)
+
+        self.export_button.clicked.connect(self.export_current_cookies)
+        self.close_button.clicked.connect(self.accept)
+
+    def _cache_cookie(self, platform: str, cookie: QNetworkCookie) -> None:
+        target = self.cookie_cache[platform]
+        for idx, current in enumerate(target):
+            if current.name() == cookie.name() and current.domain() == cookie.domain() and current.path() == cookie.path():
+                target[idx] = cookie
+                return
+        target.append(cookie)
+
+    def export_current_cookies(self) -> None:
+        platform = self.tabs.tabText(self.tabs.currentIndex())
+        cookies = self.cookie_cache.get(platform, [])
+        if not cookies:
+            QMessageBox.warning(self, "提示", "当前平台还没有捕获到 Cookie，请先完成登录或刷新页面")
+            return
+
+        filename = os.path.join(tempfile.gettempdir(), f"moran_player_{platform}.cookies.txt")
+        with open(filename, "w", encoding="utf-8") as fp:
+            fp.write("# Netscape HTTP Cookie File\n")
+            for cookie in cookies:
+                domain = bytes(cookie.domain()).decode("utf-8", errors="ignore")
+                path = bytes(cookie.path()).decode("utf-8", errors="ignore") or "/"
+                name = bytes(cookie.name()).decode("utf-8", errors="ignore")
+                value = bytes(cookie.value()).decode("utf-8", errors="ignore")
+                secure = "TRUE" if cookie.isSecure() else "FALSE"
+                include_subdomain = "TRUE" if domain.startswith(".") else "FALSE"
+                expires = str(int(cookie.expirationDate().toSecsSinceEpoch())) if not cookie.isSessionCookie() else "0"
+                fp.write(f"{domain}\t{include_subdomain}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+        self.cookies_exported.emit(platform, filename)
+        QMessageBox.information(self, "成功", f"{platform} Cookies 已导出，可用于解析受限音频")
+
+
+class MusicPlayer(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Moran 多平台音乐播放器")
+        self.resize(1140, 760)
+
+        self.player = QMediaPlayer(self)
+        self.results: List[TrackResult] = []
+        self.cookie_files: Dict[str, str] = {}
+
+        root = QWidget(self)
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        title = QLabel("Moran 多平台音乐播放器")
+        title.setObjectName("title")
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("输入歌曲名、歌手或关键字")
+        self.search_button = QPushButton("聚合搜索")
+        self.login_button = QPushButton("平台登录")
+
+        self.platform_checks: Dict[str, QCheckBox] = {}
+        platform_row = QHBoxLayout()
+        for name in PLATFORMS:
+            check = QCheckBox(name)
+            check.setChecked(True)
+            self.platform_checks[name] = check
+            platform_row.addWidget(check)
+        platform_row.addStretch(1)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(self.search_input, 6)
+        search_row.addWidget(self.search_button, 1)
+        search_row.addWidget(self.login_button, 1)
+
+        self.result_table = QTableWidget(0, 5)
+        self.result_table.setHorizontalHeaderLabels(["平台", "标题", "作者", "时长", "链接"])
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        self.add_button = QPushButton("加入播放列表")
+        self.play_button = QPushButton("播放选中")
+        self.pause_button = QPushButton("暂停")
+        self.stop_button = QPushButton("停止")
+
+        control_row = QHBoxLayout()
+        for button in [self.add_button, self.play_button, self.pause_button, self.stop_button]:
+            control_row.addWidget(button)
+
+        self.playlist = QListWidget()
+        self.progress = QSlider(Qt.Horizontal)
+        self.progress.setRange(0, 0)
+        self.status = QLabel("状态：就绪")
+
+        layout.addWidget(title)
+        layout.addLayout(search_row)
+        layout.addLayout(platform_row)
+        layout.addWidget(self.result_table, 5)
+        layout.addLayout(control_row)
+        layout.addWidget(QLabel("播放列表"))
+        layout.addWidget(self.playlist, 3)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.status)
+
+        self._setup_style()
+        self._connect_signals()
+
+    def _setup_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget { background: #0f172a; color: #e2e8f0; font-size: 14px; }
+            QLineEdit, QListWidget, QTableWidget {
+                background: #111827; border: 1px solid #334155; border-radius: 8px; padding: 6px;
+            }
+            QPushButton {
+                background: #2563eb; border: none; border-radius: 8px; padding: 8px 14px; color: white;
+            }
+            QPushButton:hover { background: #1d4ed8; }
+            QHeaderView::section { background: #1e293b; color: #cbd5e1; padding: 6px; border: 0; }
+            QLabel#title { font-size: 28px; font-weight: 700; color: #93c5fd; padding: 6px 0; }
+            """
+        )
 
     def _connect_signals(self) -> None:
-        self.add_button.clicked.connect(self.add_track)
-        self.play_button.clicked.connect(self.play_selected)
+        self.search_button.clicked.connect(self.search_tracks)
+        self.login_button.clicked.connect(self.open_login_dialog)
+        self.add_button.clicked.connect(self.add_selected_to_playlist)
+        self.play_button.clicked.connect(self.play_selected_playlist)
         self.pause_button.clicked.connect(self.player.pause)
         self.stop_button.clicked.connect(self.player.stop)
-        self.delete_button.clicked.connect(self.delete_selected)
-        self.local_button.clicked.connect(self.import_local_file)
 
-        self.list_widget.itemDoubleClicked.connect(self.play_item)
+        self.result_table.doubleClicked.connect(self.add_selected_to_playlist)
+        self.playlist.itemDoubleClicked.connect(self.play_playlist_item)
 
-        self.player.stateChanged.connect(self.on_state_changed)
-        self.player.positionChanged.connect(self.on_position_changed)
-        self.player.durationChanged.connect(self.on_duration_changed)
-        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.positionChanged.connect(self.progress.setValue)
+        self.player.durationChanged.connect(lambda d: self.progress.setRange(0, d))
+        self.progress.sliderMoved.connect(self.player.setPosition)
 
-        self.position_slider.sliderMoved.connect(self.player.setPosition)
+    def selected_platforms(self) -> List[str]:
+        return [name for name, check in self.platform_checks.items() if check.isChecked()]
 
-    def add_track(self) -> None:
-        url = self.url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, "提示", "请输入音频 URL")
+    def search_tracks(self) -> None:
+        keyword = self.search_input.text().strip()
+        if not keyword:
+            QMessageBox.warning(self, "提示", "请输入搜索关键词")
             return
 
-        name = self.name_input.text().strip() or url.split("/")[-1] or "未命名音频"
-        self.tracks.append((name, url))
-
-        item = QListWidgetItem(name)
-        item.setData(256, url)  # Qt.UserRole
-        self.list_widget.addItem(item)
-
-        self.url_input.clear()
-        self.name_input.clear()
-        self.status_label.setText(f"状态：已添加 {name}")
-
-    def import_local_file(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择音频文件",
-            "",
-            "Audio Files (*.mp3 *.wav *.ogg *.flac);;All Files (*)",
-        )
-        if not file_path:
+        platforms = self.selected_platforms()
+        if not platforms:
+            QMessageBox.warning(self, "提示", "请至少勾选一个平台")
             return
 
-        name = file_path.split("/")[-1]
-        item = QListWidgetItem(name)
-        item.setData(256, file_path)
-        self.list_widget.addItem(item)
-        self.status_label.setText(f"状态：已导入 {name}")
+        self.status.setText("状态：正在聚合搜索...")
+        self.search_button.setEnabled(False)
+        self.search_worker = SearchWorker(keyword, platforms)
+        self.search_worker.finished.connect(self.on_search_finished)
+        self.search_worker.failed.connect(self.on_worker_failed)
+        self.search_worker.finished.connect(lambda _: self.search_button.setEnabled(True))
+        self.search_worker.failed.connect(lambda _: self.search_button.setEnabled(True))
+        self.search_worker.start()
 
-    def play_selected(self) -> None:
-        item = self.list_widget.currentItem()
+    def on_search_finished(self, results: List[TrackResult]) -> None:
+        self.results = results
+        self.result_table.setRowCount(len(results))
+        for row, track in enumerate(results):
+            self.result_table.setItem(row, 0, QTableWidgetItem(track.platform))
+            self.result_table.setItem(row, 1, QTableWidgetItem(track.title))
+            self.result_table.setItem(row, 2, QTableWidgetItem(track.artist))
+            self.result_table.setItem(row, 3, QTableWidgetItem(track.duration))
+            self.result_table.setItem(row, 4, QTableWidgetItem(track.webpage_url))
+        self.status.setText(f"状态：搜索完成，共 {len(results)} 条结果")
+
+    def on_worker_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "错误", message)
+        self.status.setText("状态：请求失败")
+
+    def add_selected_to_playlist(self) -> None:
+        row = self.result_table.currentRow()
+        if row < 0 or row >= len(self.results):
+            QMessageBox.information(self, "提示", "请先在搜索结果中选择一项")
+            return
+
+        track = self.results[row]
+        item = QListWidgetItem(f"[{track.platform}] {track.title} - {track.artist}")
+        item.setData(Qt.UserRole, track)
+        self.playlist.addItem(item)
+        self.status.setText(f"状态：已加入播放列表 - {track.title}")
+
+    def play_selected_playlist(self) -> None:
+        item = self.playlist.currentItem()
         if not item:
-            QMessageBox.information(self, "提示", "请先选择一首歌曲")
+            QMessageBox.information(self, "提示", "请先在播放列表选择一项")
             return
-        self.play_item(item)
+        self.play_playlist_item(item)
 
-    def play_item(self, item: QListWidgetItem) -> None:
-        source = item.data(256)
-        if source.startswith("http://") or source.startswith("https://"):
-            media = QMediaContent(QUrl(source))
-        else:
-            media = QMediaContent(QUrl.fromLocalFile(source))
+    def play_playlist_item(self, item: QListWidgetItem) -> None:
+        track = item.data(Qt.UserRole)
+        cookie_file = self.cookie_files.get(track.platform)
+        self.status.setText(f"状态：正在解析音频流 - {track.title}")
 
-        self.player.setMedia(media)
+        self.resolve_worker = ResolveWorker(track, cookie_file)
+        self.resolve_worker.finished.connect(lambda url, t=track: self.on_stream_resolved(t, url))
+        self.resolve_worker.failed.connect(self.on_worker_failed)
+        self.resolve_worker.start()
+
+    def on_stream_resolved(self, track: TrackResult, stream_url: str) -> None:
+        self.player.setMedia(QMediaContent(QUrl(stream_url)))
         self.player.play()
-        self.status_label.setText(f"状态：正在播放 {item.text()}")
+        self.status.setText(f"状态：正在播放 {track.title}")
 
-    def delete_selected(self) -> None:
-        row = self.list_widget.currentRow()
-        if row < 0:
-            return
-        removed = self.list_widget.takeItem(row)
-        self.status_label.setText(f"状态：已删除 {removed.text()}")
+    def open_login_dialog(self) -> None:
+        dialog = LoginDialog(self)
+        dialog.cookies_exported.connect(self.on_cookies_exported)
+        dialog.exec_()
 
-    def on_state_changed(self, state: QMediaPlayer.State) -> None:
-        state_text = {
-            QMediaPlayer.StoppedState: "停止",
-            QMediaPlayer.PlayingState: "播放中",
-            QMediaPlayer.PausedState: "已暂停",
-        }.get(state, "未知")
-        self.status_label.setText(f"状态：{state_text}")
-
-    def on_position_changed(self, position: int) -> None:
-        self.position_slider.setValue(position)
-
-    def on_duration_changed(self, duration: int) -> None:
-        self.position_slider.setRange(0, duration)
-
-    def on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
-        if status == QMediaPlayer.InvalidMedia:
-            QMessageBox.critical(self, "错误", "无法播放该音频，请检查 URL 或音频格式")
-            self.status_label.setText("状态：播放失败")
+    def on_cookies_exported(self, platform: str, cookie_file: str) -> None:
+        self.cookie_files[platform] = cookie_file
+        self.status.setText(f"状态：{platform} 登录信息已保存")
 
 
 def main() -> None:
     app = QApplication(sys.argv)
-    window = OnlineMusicPlayer()
+    window = MusicPlayer()
     window.show()
     sys.exit(app.exec_())
 
