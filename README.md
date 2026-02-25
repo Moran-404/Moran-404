@@ -48,6 +48,7 @@ python main.py
 - 程序启动时会自动检查 `PyQt5` 与 `PyQtWebEngine` 版本是否完全一致；若不一致会自动关闭内嵌登录并给出诊断信息，避免直接崩溃。
 - Windows 下可尝试在启动前设置环境变量 `QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --disable-gpu-compositing` 以规避部分显卡驱动导致的空白页面问题。
 - 若内嵌页能打开但几秒后闪退，可在启动前设置 `QT_OPENGL=software` 与 `QTWEBENGINE_DISABLE_SANDBOX=1`；本程序也会在 Windows 下默认注入这些兼容参数。
+- 登录窗口提供“独立内嵌登录(防崩)”按钮：会在独立进程打开内嵌页，即使 WebEngine 崩溃也不会拖垮主播放器进程。
 - 登录弹窗已改为“单标签页单实例加载”策略（切换平台时再按需创建内嵌页），以减少多 WebEngine 同时初始化导致的崩溃风险。
 - 程序默认优先使用内嵌登录；若你的环境仍不稳定，可设置 `MORAN_SAFE_LOGIN_MODE=1`（或 `MORAN_DISABLE_EMBEDDED_LOGIN=1`）强制使用外部浏览器登录模式。
 

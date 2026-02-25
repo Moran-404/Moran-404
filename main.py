@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from importlib.metadata import PackageNotFoundError, version
@@ -370,6 +371,7 @@ class LoginDialog(QDialog):
 
         self.export_button = QPushButton("导出当前平台 Cookies")
         self.open_browser_button = QPushButton("系统浏览器登录当前平台")
+        self.standalone_login_button = QPushButton("独立内嵌登录(防崩)")
         self.retry_embedded_button = QPushButton("重试内嵌登录")
         self.import_button = QPushButton("导入已有 Cookie 文件")
         self.close_button = QPushButton("关闭")
@@ -377,6 +379,7 @@ class LoginDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.export_button)
         button_layout.addWidget(self.open_browser_button)
+        button_layout.addWidget(self.standalone_login_button)
         button_layout.addWidget(self.retry_embedded_button)
         button_layout.addWidget(self.import_button)
         button_layout.addStretch(1)
@@ -389,6 +392,7 @@ class LoginDialog(QDialog):
 
         self.export_button.clicked.connect(self.export_current_cookies)
         self.open_browser_button.clicked.connect(self.open_current_platform_in_browser)
+        self.standalone_login_button.clicked.connect(self.open_standalone_embedded_login)
         self.retry_embedded_button.clicked.connect(self.retry_embedded_login)
         self.import_button.clicked.connect(self.import_cookie_file)
         self.close_button.clicked.connect(self.accept)
@@ -505,6 +509,23 @@ class LoginDialog(QDialog):
             "已在系统浏览器打开登录页。登录完成后，请回到应用点击“导入已有 Cookie 文件”。",
         )
 
+    def open_standalone_embedded_login(self) -> None:
+        platform = self.tabs.tabText(self.tabs.currentIndex())
+        if platform not in PLATFORMS:
+            QMessageBox.warning(self, "提示", "请先选择一个有效平台")
+            return
+
+        cmd = [sys.executable, os.path.abspath(__file__), "--login-helper", platform]
+        result = subprocess.run(cmd, check=False)
+        if result.returncode in (0, 1):
+            cookie_file = os.path.join(tempfile.gettempdir(), f"moran_player_{platform}.cookies.txt")
+            if os.path.exists(cookie_file):
+                self.cookies_exported.emit(platform, cookie_file)
+                QMessageBox.information(self, "成功", f"已同步 {platform} Cookies（来自独立内嵌登录）")
+                return
+
+        QMessageBox.warning(self, "提示", "独立内嵌登录未完成或失败，请重试。")
+
     def retry_embedded_login(self) -> None:
         self.webengine_view_class = load_webengine_view_class()
         if not self.webengine_view_class:
@@ -574,6 +595,85 @@ class LoginDialog(QDialog):
             return
         self.cookies_exported.emit(platform, file_path)
         QMessageBox.information(self, "成功", f"已为 {platform} 导入 Cookie 文件")
+
+
+class StandaloneLoginHelper(QDialog):
+    def __init__(self, platform: str) -> None:
+        super().__init__()
+        self.platform = platform
+        self.setWindowTitle(f"独立内嵌登录 - {platform}")
+        self.resize(980, 720)
+        self.cookie_cache: List[QNetworkCookie] = []
+
+        view_class = load_webengine_view_class()
+        if not view_class:
+            raise RuntimeError(WEBENGINE_IMPORT_ERROR or "当前环境无法初始化内嵌 WebEngine")
+
+        conf = PLATFORMS.get(platform)
+        if not conf:
+            raise RuntimeError("未知平台")
+
+        self.view = view_class(self)
+        self.view.setUrl(QUrl(conf["login_url"]))
+        store = self.view.page().profile().cookieStore()
+        store.cookieAdded.connect(self._cache_cookie)
+        store.loadAllCookies()
+
+        self.tip = QLabel("在此窗口完成登录后，点击导出并关闭。")
+        self.export_btn = QPushButton("导出 Cookies 并关闭")
+        self.cancel_btn = QPushButton("取消")
+
+        row = QHBoxLayout()
+        row.addWidget(self.export_btn)
+        row.addStretch(1)
+        row.addWidget(self.cancel_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tip)
+        layout.addWidget(self.view)
+        layout.addLayout(row)
+
+        self.export_btn.clicked.connect(self.export_and_close)
+        self.cancel_btn.clicked.connect(self.reject)
+
+    def _cache_cookie(self, cookie: QNetworkCookie) -> None:
+        for idx, current in enumerate(self.cookie_cache):
+            if current.name() == cookie.name() and current.domain() == cookie.domain() and current.path() == cookie.path():
+                self.cookie_cache[idx] = cookie
+                return
+        self.cookie_cache.append(cookie)
+
+    def export_and_close(self) -> None:
+        if not self.cookie_cache:
+            QMessageBox.warning(self, "提示", "还未捕获到 Cookie，请先完成登录或刷新页面")
+            return
+
+        filename = os.path.join(tempfile.gettempdir(), f"moran_player_{self.platform}.cookies.txt")
+        with open(filename, "w", encoding="utf-8") as fp:
+            fp.write("# Netscape HTTP Cookie File\n")
+            for cookie in self.cookie_cache:
+                domain = bytes(cookie.domain()).decode("utf-8", errors="ignore")
+                path = bytes(cookie.path()).decode("utf-8", errors="ignore") or "/"
+                name = bytes(cookie.name()).decode("utf-8", errors="ignore")
+                value = bytes(cookie.value()).decode("utf-8", errors="ignore")
+                secure = "TRUE" if cookie.isSecure() else "FALSE"
+                include_subdomain = "TRUE" if domain.startswith(".") else "FALSE"
+                expires = str(int(cookie.expirationDate().toSecsSinceEpoch())) if not cookie.isSessionCookie() else "0"
+                fp.write(f"{domain}\t{include_subdomain}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+        QMessageBox.information(self, "成功", f"已导出 {self.platform} Cookies")
+        self.accept()
+
+
+def run_standalone_login_helper(platform: str) -> int:
+    init_webengine_runtime()
+    app = QApplication(sys.argv)
+    try:
+        dialog = StandaloneLoginHelper(platform)
+    except Exception as exc:  # noqa: BLE001
+        QMessageBox.critical(None, "错误", f"独立内嵌登录启动失败：{exc}")
+        return 2
+    return dialog.exec_()
 
 
 class MusicPlayer(QMainWindow):
@@ -861,6 +961,9 @@ class MusicPlayer(QMainWindow):
 
 
 def main() -> None:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--login-helper":
+        sys.exit(run_standalone_login_helper(sys.argv[2]))
+
     init_webengine_runtime()
     app = QApplication(sys.argv)
     window = MusicPlayer()
