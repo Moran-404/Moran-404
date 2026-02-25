@@ -9,6 +9,7 @@ from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
 
 from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
+from PyQt5.QtGui import QFont
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtNetwork import QNetworkCookie
 from PyQt5.QtWidgets import (
@@ -366,6 +367,7 @@ class MusicPlayer(QMainWindow):
         self.player = QMediaPlayer(self)
         self.results: List[TrackResult] = []
         self.cookie_files: Dict[str, str] = {}
+        self.current_track: Optional[TrackResult] = None
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -401,15 +403,22 @@ class MusicPlayer(QMainWindow):
 
         self.add_button = QPushButton("加入播放列表")
         self.play_button = QPushButton("播放选中")
-        self.pause_button = QPushButton("暂停")
-        self.stop_button = QPushButton("停止")
+        self.pause_resume_button = QPushButton("暂停")
+
+        self.search_button.setObjectName("primaryButton")
+        self.play_button.setObjectName("primaryButton")
+        self.add_button.setObjectName("subtleButton")
+        self.login_button.setObjectName("subtleButton")
+        self.pause_resume_button.setObjectName("subtleButton")
 
         control_row = QHBoxLayout()
-        for button in [self.add_button, self.play_button, self.pause_button, self.stop_button]:
+        control_row.setSpacing(10)
+        for button in [self.add_button, self.play_button, self.pause_resume_button]:
             control_row.addWidget(button)
 
         self.playlist = QListWidget()
         self.progress = QSlider(Qt.Horizontal)
+        self.progress.setObjectName("progressBar")
         self.progress.setRange(0, 0)
         self.status = QLabel("状态：就绪")
 
@@ -423,22 +432,81 @@ class MusicPlayer(QMainWindow):
         layout.addWidget(self.progress)
         layout.addWidget(self.status)
 
+        app_font = QFont("Microsoft YaHei UI", 10)
+        self.setFont(app_font)
+
         self._setup_style()
         self._connect_signals()
 
     def _setup_style(self) -> None:
         self.setStyleSheet(
             """
-            QWidget { background: #0f172a; color: #e2e8f0; font-size: 14px; }
+            QWidget {
+                background: #0b1220;
+                color: #e2e8f0;
+                font-size: 14px;
+                font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI", sans-serif;
+            }
             QLineEdit, QListWidget, QTableWidget {
-                background: #111827; border: 1px solid #334155; border-radius: 8px; padding: 6px;
+                background: #111827;
+                border: 1px solid #334155;
+                border-radius: 10px;
+                padding: 7px;
+            }
+            QListWidget::item { padding: 5px 2px; }
+            QListWidget::item:selected, QTableWidget::item:selected {
+                background: #1d4ed8;
+                color: #f8fafc;
             }
             QPushButton {
-                background: #2563eb; border: none; border-radius: 8px; padding: 8px 14px; color: white;
+                border-radius: 10px;
+                padding: 8px 16px;
+                border: 1px solid transparent;
+                font-weight: 600;
             }
-            QPushButton:hover { background: #1d4ed8; }
-            QHeaderView::section { background: #1e293b; color: #cbd5e1; padding: 6px; border: 0; }
-            QLabel#title { font-size: 28px; font-weight: 700; color: #93c5fd; padding: 6px 0; }
+            QPushButton#primaryButton {
+                background: #2563eb;
+                color: #ffffff;
+            }
+            QPushButton#primaryButton:hover { background: #1d4ed8; }
+            QPushButton#subtleButton {
+                background: #1e293b;
+                color: #cbd5e1;
+                border-color: #334155;
+            }
+            QPushButton#subtleButton:hover {
+                background: #273449;
+                color: #f1f5f9;
+            }
+            QHeaderView::section {
+                background: #182235;
+                color: #cbd5e1;
+                padding: 7px;
+                border: 0;
+                font-weight: 600;
+            }
+            QSlider#progressBar::groove:horizontal {
+                border: none;
+                height: 8px;
+                border-radius: 4px;
+                background: #1f2937;
+            }
+            QSlider#progressBar::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #22d3ee, stop:1 #3b82f6);
+                border-radius: 4px;
+            }
+            QSlider#progressBar::add-page:horizontal {
+                background: #273549;
+                border-radius: 4px;
+            }
+            QSlider#progressBar::handle:horizontal {
+                width: 16px;
+                margin: -4px 0;
+                border-radius: 8px;
+                border: 2px solid #dbeafe;
+                background: #60a5fa;
+            }
+            QLabel#title { font-size: 30px; font-weight: 700; color: #93c5fd; padding: 6px 0; }
             """
         )
 
@@ -447,14 +515,14 @@ class MusicPlayer(QMainWindow):
         self.login_button.clicked.connect(self.open_login_dialog)
         self.add_button.clicked.connect(self.add_selected_to_playlist)
         self.play_button.clicked.connect(self.play_selected_playlist)
-        self.pause_button.clicked.connect(self.player.pause)
-        self.stop_button.clicked.connect(self.player.stop)
+        self.pause_resume_button.clicked.connect(self.toggle_playback)
 
         self.result_table.doubleClicked.connect(self.add_selected_to_playlist)
         self.playlist.itemDoubleClicked.connect(self.play_playlist_item)
 
         self.player.positionChanged.connect(self.progress.setValue)
         self.player.durationChanged.connect(lambda d: self.progress.setRange(0, d))
+        self.player.stateChanged.connect(self.on_player_state_changed)
         self.progress.sliderMoved.connect(self.player.setPosition)
 
     def selected_platforms(self) -> List[str]:
@@ -494,6 +562,7 @@ class MusicPlayer(QMainWindow):
     def on_worker_failed(self, message: str) -> None:
         QMessageBox.critical(self, "错误", message)
         self.status.setText("状态：请求失败")
+        self.pause_resume_button.setText("播放")
 
     def add_selected_to_playlist(self) -> None:
         row = self.result_table.currentRow()
@@ -509,25 +578,59 @@ class MusicPlayer(QMainWindow):
 
     def play_selected_playlist(self) -> None:
         item = self.playlist.currentItem()
+        if not item and self.playlist.count() > 0:
+            item = self.playlist.item(0)
+            self.playlist.setCurrentItem(item)
+
         if not item:
             QMessageBox.information(self, "提示", "请先在播放列表选择一项")
             return
+
+        track = item.data(Qt.UserRole)
+        if self.current_track and self.current_track.webpage_url == track.webpage_url:
+            if self.player.state() != QMediaPlayer.PlayingState:
+                self.player.play()
+                self.status.setText(f"状态：继续播放 {track.title}")
+            return
+
         self.play_playlist_item(item)
 
     def play_playlist_item(self, item: QListWidgetItem) -> None:
         track = item.data(Qt.UserRole)
         cookie_file = self.cookie_files.get(track.platform)
         self.status.setText(f"状态：正在解析音频流 - {track.title}")
+        self.play_button.setEnabled(False)
 
         self.resolve_worker = ResolveWorker(track, cookie_file)
         self.resolve_worker.finished.connect(lambda url, t=track: self.on_stream_resolved(t, url))
         self.resolve_worker.failed.connect(self.on_worker_failed)
+        self.resolve_worker.finished.connect(lambda _: self.play_button.setEnabled(True))
+        self.resolve_worker.failed.connect(lambda _: self.play_button.setEnabled(True))
         self.resolve_worker.start()
 
     def on_stream_resolved(self, track: TrackResult, stream_url: str) -> None:
+        self.current_track = track
         self.player.setMedia(QMediaContent(QUrl(stream_url)))
         self.player.play()
         self.status.setText(f"状态：正在播放 {track.title}")
+
+    def toggle_playback(self) -> None:
+        if not self.current_track:
+            self.play_selected_playlist()
+            return
+
+        if self.player.state() == QMediaPlayer.PlayingState:
+            self.player.pause()
+            self.status.setText(f"状态：已暂停 {self.current_track.title}")
+        else:
+            self.player.play()
+            self.status.setText(f"状态：正在播放 {self.current_track.title}")
+
+    def on_player_state_changed(self, state: int) -> None:
+        if state == QMediaPlayer.PlayingState:
+            self.pause_resume_button.setText("暂停")
+        else:
+            self.pause_resume_button.setText("播放")
 
     def open_login_dialog(self) -> None:
         dialog = LoginDialog(self)
