@@ -318,34 +318,66 @@ class ResolveWorker(QThread):
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, track: TrackResult, cookie_file: Optional[str]) -> None:
+    def __init__(self, track: TrackResult, cookie_file: Optional[str], browser_cookie_source: Optional[str]) -> None:
         super().__init__()
         self.track = track
         self.cookie_file = cookie_file
+        self.browser_cookie_source = browser_cookie_source
+
+    def _resolve_with_options(self, options: Dict[str, Any]) -> Optional[str]:
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(self.track.webpage_url, download=False)
+                stream_url = info.get("url") if info else None
+                if stream_url:
+                    return stream_url
+        except Exception:  # noqa: BLE001
+            return None
+        return None
 
     def run(self) -> None:
-        options = {
+        base_options = {
             "quiet": True,
             "skip_download": True,
             "format": "bestaudio/best",
             "noplaylist": True,
         }
-        if self.cookie_file and os.path.exists(self.cookie_file):
-            options["cookiefile"] = self.cookie_file
 
-        try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(self.track.webpage_url, download=False)
-                stream_url = info.get("url")
-                if not stream_url:
-                    raise RuntimeError("未解析到可播放音频地址")
+        # 1) plain resolve first
+        stream_url = self._resolve_with_options(dict(base_options))
+        if stream_url:
+            self.finished.emit(stream_url)
+            return
+
+        # 2) cookie file resolve
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            opts = dict(base_options)
+            opts["cookiefile"] = self.cookie_file
+            stream_url = self._resolve_with_options(opts)
+            if stream_url:
                 self.finished.emit(stream_url)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+                return
+
+        # 3) browser-cookie resolve (免导入)
+        browsers = [self.browser_cookie_source] if self.browser_cookie_source else []
+        for fallback in ["edge", "chrome", "firefox"]:
+            if fallback not in browsers:
+                browsers.append(fallback)
+
+        for browser in browsers:
+            opts = dict(base_options)
+            opts["cookiesfrombrowser"] = (browser, None, None, None)
+            stream_url = self._resolve_with_options(opts)
+            if stream_url:
+                self.finished.emit(stream_url)
+                return
+
+        self.failed.emit("未解析到可播放音频地址（已尝试普通解析、Cookie 文件与浏览器登录态）")
 
 
 class LoginDialog(QDialog):
     cookies_exported = pyqtSignal(str, str)
+    browser_cookie_selected = pyqtSignal(str, str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -374,6 +406,7 @@ class LoginDialog(QDialog):
         self.standalone_login_button = QPushButton("独立内嵌登录(防崩)")
         self.retry_embedded_button = QPushButton("重试内嵌登录")
         self.import_button = QPushButton("导入已有 Cookie 文件")
+        self.use_browser_cookie_button = QPushButton("免导入：读取浏览器登录态")
         self.close_button = QPushButton("关闭")
 
         button_layout = QHBoxLayout()
@@ -382,6 +415,7 @@ class LoginDialog(QDialog):
         button_layout.addWidget(self.standalone_login_button)
         button_layout.addWidget(self.retry_embedded_button)
         button_layout.addWidget(self.import_button)
+        button_layout.addWidget(self.use_browser_cookie_button)
         button_layout.addStretch(1)
         button_layout.addWidget(self.close_button)
 
@@ -395,6 +429,7 @@ class LoginDialog(QDialog):
         self.standalone_login_button.clicked.connect(self.open_standalone_embedded_login)
         self.retry_embedded_button.clicked.connect(self.retry_embedded_login)
         self.import_button.clicked.connect(self.import_cookie_file)
+        self.use_browser_cookie_button.clicked.connect(self.use_browser_cookie_mode)
         self.close_button.clicked.connect(self.accept)
         self.tabs.currentChanged.connect(self.on_login_tab_changed)
 
@@ -525,6 +560,20 @@ class LoginDialog(QDialog):
                 return
 
         QMessageBox.warning(self, "提示", "独立内嵌登录未完成或失败，请重试。")
+
+    def use_browser_cookie_mode(self) -> None:
+        platform = self.tabs.tabText(self.tabs.currentIndex())
+        if platform not in PLATFORMS:
+            QMessageBox.warning(self, "提示", "请先选择一个有效平台")
+            return
+
+        browser = "edge" if sys.platform.startswith("win") else "chrome"
+        self.browser_cookie_selected.emit(platform, browser)
+        QMessageBox.information(
+            self,
+            "已启用",
+            f"{platform} 已启用免导入模式：播放时将自动读取 {browser} 浏览器登录态。\n请先在该浏览器里完成平台登录。",
+        )
 
     def retry_embedded_login(self) -> None:
         self.webengine_view_class = load_webengine_view_class()
@@ -685,6 +734,7 @@ class MusicPlayer(QMainWindow):
         self.player = QMediaPlayer(self)
         self.results: List[TrackResult] = []
         self.cookie_files: Dict[str, str] = {}
+        self.browser_cookie_sources: Dict[str, str] = {}
         self.current_track: Optional[TrackResult] = None
 
         root = QWidget(self)
@@ -916,10 +966,11 @@ class MusicPlayer(QMainWindow):
     def play_playlist_item(self, item: QListWidgetItem) -> None:
         track = item.data(Qt.UserRole)
         cookie_file = self.cookie_files.get(track.platform)
+        browser_cookie_source = self.browser_cookie_sources.get(track.platform)
         self.status.setText(f"状态：正在解析音频流 - {track.title}")
         self.play_button.setEnabled(False)
 
-        self.resolve_worker = ResolveWorker(track, cookie_file)
+        self.resolve_worker = ResolveWorker(track, cookie_file, browser_cookie_source)
         self.resolve_worker.finished.connect(lambda url, t=track: self.on_stream_resolved(t, url))
         self.resolve_worker.failed.connect(self.on_worker_failed)
         self.resolve_worker.finished.connect(lambda _: self.play_button.setEnabled(True))
@@ -953,11 +1004,16 @@ class MusicPlayer(QMainWindow):
     def open_login_dialog(self) -> None:
         dialog = LoginDialog(self)
         dialog.cookies_exported.connect(self.on_cookies_exported)
+        dialog.browser_cookie_selected.connect(self.on_browser_cookie_selected)
         dialog.exec_()
 
     def on_cookies_exported(self, platform: str, cookie_file: str) -> None:
         self.cookie_files[platform] = cookie_file
         self.status.setText(f"状态：{platform} 登录信息已保存")
+
+    def on_browser_cookie_selected(self, platform: str, browser: str) -> None:
+        self.browser_cookie_sources[platform] = browser
+        self.status.setText(f"状态：{platform} 已启用免导入模式（{browser} 浏览器登录态）")
 
 
 def main() -> None:
