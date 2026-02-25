@@ -1,9 +1,12 @@
 import importlib
+import json
 import os
 import sys
 import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote_plus, urlencode
+from urllib.request import Request, urlopen
 
 from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
@@ -43,22 +46,18 @@ def load_webengine_view_class() -> Optional[Any]:
 PLATFORMS = {
     "网易云": {
         "domain": "music.163.com",
-        "search_hint": "site:music.163.com",
         "login_url": "https://music.163.com/#/login",
     },
     "酷狗": {
         "domain": "kugou.com",
-        "search_hint": "site:kugou.com/song",
         "login_url": "https://www.kugou.com/",
     },
     "酷我": {
         "domain": "kuwo.cn",
-        "search_hint": "site:kuwo.cn/play_detail",
         "login_url": "https://www.kuwo.cn/",
     },
     "Bilibili": {
         "domain": "bilibili.com",
-        "search_hint": "site:bilibili.com/video",
         "login_url": "https://www.bilibili.com/",
     },
 }
@@ -82,50 +81,133 @@ class SearchWorker(QThread):
         self.keyword = keyword
         self.platforms = platforms
 
+    @staticmethod
+    def _seconds_to_text(seconds: Optional[int]) -> str:
+        if isinstance(seconds, int) and seconds >= 0:
+            return f"{seconds // 60:02d}:{seconds % 60:02d}"
+        return "--:--"
+
+    @staticmethod
+    def _read_json(url: str, *, headers: Optional[Dict[str, str]] = None, method: str = "GET", data: Optional[bytes] = None) -> Dict[str, Any]:
+        req = Request(url, data=data, method=method)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        if headers:
+            for key, value in headers.items():
+                req.add_header(key, value)
+        with urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+    def _search_netease(self) -> List[TrackResult]:
+        payload = urlencode({"s": self.keyword, "type": "1", "offset": "0", "limit": "12"}).encode("utf-8")
+        data = self._read_json(
+            "https://music.163.com/api/cloudsearch/pc",
+            headers={"Referer": "https://music.163.com/", "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+            data=payload,
+        )
+        songs = data.get("result", {}).get("songs", [])
+        out: List[TrackResult] = []
+        for song in songs[:5]:
+            song_id = song.get("id")
+            artists = song.get("ar") or song.get("artists") or []
+            artist_text = "/".join(a.get("name", "") for a in artists if a.get("name")) or "未知作者"
+            out.append(
+                TrackResult(
+                    platform="网易云",
+                    title=song.get("name") or "未知标题",
+                    artist=artist_text,
+                    duration=self._seconds_to_text(int(song.get("dt", 0) / 1000) if song.get("dt") else None),
+                    webpage_url=f"https://music.163.com/#/song?id={song_id}",
+                )
+            )
+        return out
+
+    def _search_kugou(self) -> List[TrackResult]:
+        url = f"https://mobilecdn.kugou.com/api/v3/search/song?format=json&keyword={quote_plus(self.keyword)}&page=1&pagesize=12"
+        data = self._read_json(url)
+        infos = data.get("data", {}).get("info", [])
+        out: List[TrackResult] = []
+        for song in infos[:5]:
+            song_id = song.get("hash")
+            out.append(
+                TrackResult(
+                    platform="酷狗",
+                    title=song.get("songname") or "未知标题",
+                    artist=song.get("singername") or "未知作者",
+                    duration=self._seconds_to_text(song.get("duration")),
+                    webpage_url=f"https://www.kugou.com/song/#hash={song_id}",
+                )
+            )
+        return out
+
+    def _search_kuwo(self) -> List[TrackResult]:
+        url = (
+            "https://www.kuwo.cn/api/www/search/searchMusicBykeyWord?"
+            f"key={quote_plus(self.keyword)}&pn=1&rn=12&httpsStatus=1&reqId="
+        )
+        data = self._read_json(url, headers={"Referer": "https://www.kuwo.cn/"})
+        songs = data.get("data", {}).get("list", [])
+        out: List[TrackResult] = []
+        for song in songs[:5]:
+            rid = song.get("rid")
+            duration_text = song.get("duration")
+            out.append(
+                TrackResult(
+                    platform="酷我",
+                    title=song.get("name") or "未知标题",
+                    artist=song.get("artist") or "未知作者",
+                    duration=duration_text or "--:--",
+                    webpage_url=f"https://www.kuwo.cn/play_detail/{rid}",
+                )
+            )
+        return out
+
+    def _search_bilibili(self) -> List[TrackResult]:
+        url = (
+            "https://api.bilibili.com/x/web-interface/search/type?"
+            f"search_type=video&keyword={quote_plus(self.keyword)}&page=1"
+        )
+        data = self._read_json(url)
+        videos = data.get("data", {}).get("result", [])
+        out: List[TrackResult] = []
+        for video in videos[:5]:
+            bvid = video.get("bvid")
+            title = (video.get("title") or "未知标题").replace("<em class=\"keyword\">", "").replace("</em>", "")
+            out.append(
+                TrackResult(
+                    platform="Bilibili",
+                    title=title,
+                    artist=video.get("author") or "未知作者",
+                    duration=video.get("duration") or "--:--",
+                    webpage_url=f"https://www.bilibili.com/video/{bvid}",
+                )
+            )
+        return out
+
     def run(self) -> None:
         merged: List[TrackResult] = []
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "extract_flat": True,
-            "default_search": "ytsearch",
-            "noplaylist": True,
+        searchers = {
+            "网易云": self._search_netease,
+            "酷狗": self._search_kugou,
+            "酷我": self._search_kuwo,
+            "Bilibili": self._search_bilibili,
         }
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                for platform in self.platforms:
-                    hint = PLATFORMS[platform]["search_hint"]
-                    domain = PLATFORMS[platform]["domain"]
-                    query = f"ytsearch12:{self.keyword} {hint}"
-                    info = ydl.extract_info(query, download=False)
-                    entries = info.get("entries", []) if info else []
-                    count = 0
-                    for entry in entries:
-                        url = entry.get("webpage_url") or entry.get("url") or ""
-                        if domain not in url:
-                            continue
-                        duration_sec = entry.get("duration")
-                        duration = (
-                            f"{duration_sec // 60:02d}:{duration_sec % 60:02d}"
-                            if isinstance(duration_sec, int)
-                            else "--:--"
-                        )
-                        merged.append(
-                            TrackResult(
-                                platform=platform,
-                                title=entry.get("title") or "未知标题",
-                                artist=entry.get("uploader") or entry.get("channel") or "未知作者",
-                                duration=duration,
-                                webpage_url=url,
-                            )
-                        )
-                        count += 1
-                        if count >= 5:
-                            break
-            self.finished.emit(merged)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+        errors: List[str] = []
+        for platform in self.platforms:
+            searcher = searchers.get(platform)
+            if not searcher:
+                continue
+            try:
+                merged.extend(searcher())
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{platform}: {exc}")
+
+        if not merged and errors:
+            self.failed.emit("；".join(errors))
+            return
+
+        self.finished.emit(merged)
 
 
 class ResolveWorker(QThread):
