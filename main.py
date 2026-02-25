@@ -42,8 +42,16 @@ def init_webengine_runtime() -> None:
     """Initialize QtWebEngine runtime before QApplication for better compatibility."""
     global WEBENGINE_IMPORT_ERROR
 
-    if sys.platform.startswith("win") and "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
-        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+    if sys.platform.startswith("win"):
+        chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+        required_flags = ["--disable-gpu", "--disable-gpu-compositing"]
+        for flag in required_flags:
+            if flag not in chromium_flags:
+                chromium_flags = f"{chromium_flags} {flag}".strip()
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = chromium_flags
+
+        os.environ.setdefault("QT_OPENGL", "software")
+        os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
     try:
         QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
@@ -304,6 +312,7 @@ class LoginDialog(QDialog):
         self.webengine_view_class = load_webengine_view_class() if self.prefer_embedded_login else None
 
         self.tabs = QTabWidget(self)
+        self.web_views: Dict[str, Any] = {}
         self.tip_label = QLabel("可优先在内嵌页登录；若页面异常，可点“系统浏览器登录当前平台”并导入 Cookie 文件。")
         if WEBENGINE_IMPORT_ERROR:
             self.tip_label.setText(self.tip_label.text() + f"\nWebEngine 诊断：{WEBENGINE_IMPORT_ERROR}")
@@ -337,10 +346,12 @@ class LoginDialog(QDialog):
         self.retry_embedded_button.clicked.connect(self.retry_embedded_login)
         self.import_button.clicked.connect(self.import_cookie_file)
         self.close_button.clicked.connect(self.accept)
+        self.tabs.currentChanged.connect(self.on_login_tab_changed)
 
     def _build_embedded_tabs(self) -> None:
         try:
-            for platform, conf in PLATFORMS.items():
+            self.web_views = {}
+            for idx, (platform, conf) in enumerate(PLATFORMS.items()):
                 view = self.webengine_view_class(self)
                 if hasattr(view, "settings"):
                     settings = view.settings()
@@ -354,8 +365,10 @@ class LoginDialog(QDialog):
                         if hasattr(settings, attr_name):
                             settings.setAttribute(getattr(settings, attr_name), True)
 
-                view.setUrl(QUrl(conf["login_url"]))
+                target_url = conf["login_url"] if idx == 0 else "about:blank"
+                view.setUrl(QUrl(target_url))
                 self.tabs.addTab(view, platform)
+                self.web_views[platform] = view
 
                 store = view.page().profile().cookieStore()
                 store.cookieAdded.connect(lambda cookie, p=platform: self._cache_cookie(p, cookie))
@@ -381,6 +394,20 @@ class LoginDialog(QDialog):
             page_layout.addWidget(open_btn)
             page_layout.addStretch(1)
             self.tabs.addTab(page, platform)
+
+    def on_login_tab_changed(self, index: int) -> None:
+        if index < 0 or not self.webengine_view_class:
+            return
+
+        platform = self.tabs.tabText(index)
+        view = self.web_views.get(platform)
+        login_url = PLATFORMS.get(platform, {}).get("login_url")
+        if not view or not login_url:
+            return
+
+        current = view.url().toString()
+        if current in ("", "about:blank"):
+            view.setUrl(QUrl(login_url))
 
     def _open_url(self, url: str) -> None:
         from PyQt5.QtGui import QDesktopServices
@@ -411,6 +438,7 @@ class LoginDialog(QDialog):
         self._build_embedded_tabs()
         if self.webengine_view_class:
             self.tip_label.setText("已切换到内嵌登录模式，请在标签页中完成登录后导出 Cookie。")
+            self.on_login_tab_changed(self.tabs.currentIndex())
 
     def _cache_cookie(self, platform: str, cookie: QNetworkCookie) -> None:
         target = self.cookie_cache[platform]
