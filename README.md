@@ -44,6 +44,9 @@ python main.py
 - Linux 下若无法播放，请检查系统多媒体后端（GStreamer/FFmpeg）。
 - 若未安装或无法正常使用 `PyQtWebEngine`，程序仍可运行，可在登录窗口中一键切换到“系统浏览器登录当前平台”并导入 Cookie 文件。
 
+- 若已安装且版本匹配但内嵌登录仍空白，优先在登录弹窗查看 “WebEngine 诊断” 信息，并使用“系统浏览器登录当前平台 + 导入 Cookie 文件”继续使用。
+- Windows 下可尝试在启动前设置环境变量 `QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu` 以规避部分显卡驱动导致的空白页面问题。
+
 ## PR 冲突处理建议
 
 当 GitHub 提示 **This branch has conflicts** 时，不建议直接“一键接受当前变化”。更安全的做法是：

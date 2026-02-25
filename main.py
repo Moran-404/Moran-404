@@ -35,13 +35,51 @@ from PyQt5.QtWidgets import (
 import yt_dlp
 
 
+WEBENGINE_IMPORT_ERROR: Optional[str] = None
+
+
+def init_webengine_runtime() -> None:
+    """Initialize QtWebEngine runtime before QApplication for better compatibility."""
+    global WEBENGINE_IMPORT_ERROR
+
+    if sys.platform.startswith("win") and "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+
+    try:
+        QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        webengine_module = importlib.import_module("PyQt5.QtWebEngine")
+        qtwebengine = getattr(webengine_module, "QtWebEngine", None)
+        if qtwebengine and hasattr(qtwebengine, "initialize"):
+            qtwebengine.initialize()
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        importlib.import_module("PyQt5.QtWebEngineWidgets")
+        WEBENGINE_IMPORT_ERROR = None
+    except Exception as exc:  # noqa: BLE001
+        WEBENGINE_IMPORT_ERROR = str(exc)
+
+
 def load_webengine_view_class() -> Optional[Any]:
     """Dynamically load QWebEngineView so app can run without PyQtWebEngine."""
+    global WEBENGINE_IMPORT_ERROR
     try:
         module = importlib.import_module("PyQt5.QtWebEngineWidgets")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        WEBENGINE_IMPORT_ERROR = str(exc)
         return None
-    return getattr(module, "QWebEngineView", None)
+
+    view_cls = getattr(module, "QWebEngineView", None)
+    if view_cls is None:
+        WEBENGINE_IMPORT_ERROR = "QWebEngineView 不可用"
+    else:
+        WEBENGINE_IMPORT_ERROR = None
+    return view_cls
 
 
 PLATFORMS = {
@@ -253,6 +291,8 @@ class LoginDialog(QDialog):
 
         self.tabs = QTabWidget(self)
         self.tip_label = QLabel("可优先在内嵌页登录；若页面异常，可点“系统浏览器登录当前平台”并导入 Cookie 文件。")
+        if WEBENGINE_IMPORT_ERROR:
+            self.tip_label.setText(self.tip_label.text() + f"\nWebEngine 诊断：{WEBENGINE_IMPORT_ERROR}")
 
         if self.webengine_view_class:
             self._build_embedded_tabs()
@@ -309,8 +349,9 @@ class LoginDialog(QDialog):
             self._build_fallback_tabs()
 
     def _build_fallback_tabs(self) -> None:
+        diagnose = f"（原因：{WEBENGINE_IMPORT_ERROR}）" if WEBENGINE_IMPORT_ERROR else ""
         self.tip_label.setText(
-            "当前环境无法使用内嵌 WebEngine。请在系统浏览器登录后，导入 Cookie 文件。"
+            f"当前环境无法使用内嵌 WebEngine{diagnose}。请在系统浏览器登录后，导入 Cookie 文件。"
         )
         for platform, conf in PLATFORMS.items():
             page = QWidget(self)
@@ -676,6 +717,7 @@ class MusicPlayer(QMainWindow):
 
 
 def main() -> None:
+    init_webengine_runtime()
     app = QApplication(sys.argv)
     window = MusicPlayer()
     window.show()
