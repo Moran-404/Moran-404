@@ -1,1 +1,3 @@
 PyQt5>=5.15,<6
+PyQtWebEngine>=5.15,<6
+yt-dlp>=2024.8.6
