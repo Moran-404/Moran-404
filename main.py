@@ -65,6 +65,22 @@ def init_webengine_runtime() -> None:
         WEBENGINE_IMPORT_ERROR = str(exc)
 
 
+
+
+def should_use_embedded_login() -> bool:
+    """Use conservative defaults to avoid QtWebEngine hard-crash on some systems."""
+    if os.environ.get("MORAN_DISABLE_EMBEDDED_LOGIN") == "1":
+        return False
+    if os.environ.get("MORAN_FORCE_EMBEDDED_LOGIN") == "1":
+        return True
+
+    # In practice, some Windows + driver combos still crash the whole process.
+    # Default to browser-login fallback unless user explicitly forces embedded mode.
+    if sys.platform.startswith("win"):
+        return False
+    return True
+
+
 def load_webengine_view_class() -> Optional[Any]:
     """Dynamically load QWebEngineView so app can run without PyQtWebEngine."""
     global WEBENGINE_IMPORT_ERROR
@@ -287,7 +303,8 @@ class LoginDialog(QDialog):
         self.setWindowTitle("平台登录")
         self.resize(980, 700)
         self.cookie_cache: Dict[str, List[QNetworkCookie]] = {name: [] for name in PLATFORMS}
-        self.webengine_view_class = load_webengine_view_class()
+        self.prefer_embedded_login = should_use_embedded_login()
+        self.webengine_view_class = load_webengine_view_class() if self.prefer_embedded_login else None
 
         self.tabs = QTabWidget(self)
         self.tip_label = QLabel("可优先在内嵌页登录；若页面异常，可点“系统浏览器登录当前平台”并导入 Cookie 文件。")
@@ -350,6 +367,9 @@ class LoginDialog(QDialog):
 
     def _build_fallback_tabs(self) -> None:
         diagnose = f"（原因：{WEBENGINE_IMPORT_ERROR}）" if WEBENGINE_IMPORT_ERROR else ""
+        if not self.prefer_embedded_login and sys.platform.startswith("win"):
+            diagnose = "（Windows 默认关闭内嵌登录以避免进程异常退出；可设置 MORAN_FORCE_EMBEDDED_LOGIN=1 强制开启）"
+
         self.tip_label.setText(
             f"当前环境无法使用内嵌 WebEngine{diagnose}。请在系统浏览器登录后，导入 Cookie 文件。"
         )
