@@ -68,16 +68,13 @@ def init_webengine_runtime() -> None:
 
 
 def should_use_embedded_login() -> bool:
-    """Use conservative defaults to avoid QtWebEngine hard-crash on some systems."""
+    """Prefer embedded login by default, with env-based escape hatches."""
     if os.environ.get("MORAN_DISABLE_EMBEDDED_LOGIN") == "1":
+        return False
+    if os.environ.get("MORAN_SAFE_LOGIN_MODE") == "1":
         return False
     if os.environ.get("MORAN_FORCE_EMBEDDED_LOGIN") == "1":
         return True
-
-    # In practice, some Windows + driver combos still crash the whole process.
-    # Default to browser-login fallback unless user explicitly forces embedded mode.
-    if sys.platform.startswith("win"):
-        return False
     return True
 
 
@@ -318,12 +315,14 @@ class LoginDialog(QDialog):
 
         self.export_button = QPushButton("导出当前平台 Cookies")
         self.open_browser_button = QPushButton("系统浏览器登录当前平台")
+        self.retry_embedded_button = QPushButton("重试内嵌登录")
         self.import_button = QPushButton("导入已有 Cookie 文件")
         self.close_button = QPushButton("关闭")
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.export_button)
         button_layout.addWidget(self.open_browser_button)
+        button_layout.addWidget(self.retry_embedded_button)
         button_layout.addWidget(self.import_button)
         button_layout.addStretch(1)
         button_layout.addWidget(self.close_button)
@@ -335,6 +334,7 @@ class LoginDialog(QDialog):
 
         self.export_button.clicked.connect(self.export_current_cookies)
         self.open_browser_button.clicked.connect(self.open_current_platform_in_browser)
+        self.retry_embedded_button.clicked.connect(self.retry_embedded_login)
         self.import_button.clicked.connect(self.import_cookie_file)
         self.close_button.clicked.connect(self.accept)
 
@@ -367,11 +367,8 @@ class LoginDialog(QDialog):
 
     def _build_fallback_tabs(self) -> None:
         diagnose = f"（原因：{WEBENGINE_IMPORT_ERROR}）" if WEBENGINE_IMPORT_ERROR else ""
-        if not self.prefer_embedded_login and sys.platform.startswith("win"):
-            diagnose = "（Windows 默认关闭内嵌登录以避免进程异常退出；可设置 MORAN_FORCE_EMBEDDED_LOGIN=1 强制开启）"
-
         self.tip_label.setText(
-            f"当前环境无法使用内嵌 WebEngine{diagnose}。请在系统浏览器登录后，导入 Cookie 文件。"
+            f"当前环境无法使用内嵌 WebEngine{diagnose}。可点“重试内嵌登录”，或使用系统浏览器登录后导入 Cookie 文件。"
         )
         for platform, conf in PLATFORMS.items():
             page = QWidget(self)
@@ -402,6 +399,18 @@ class LoginDialog(QDialog):
             "提示",
             "已在系统浏览器打开登录页。登录完成后，请回到应用点击“导入已有 Cookie 文件”。",
         )
+
+    def retry_embedded_login(self) -> None:
+        self.webengine_view_class = load_webengine_view_class()
+        if not self.webengine_view_class:
+            self.tabs.clear()
+            self._build_fallback_tabs()
+            return
+
+        self.tabs.clear()
+        self._build_embedded_tabs()
+        if self.webengine_view_class:
+            self.tip_label.setText("已切换到内嵌登录模式，请在标签页中完成登录后导出 Cookie。")
 
     def _cache_cookie(self, platform: str, cookie: QNetworkCookie) -> None:
         target = self.cookie_cache[platform]

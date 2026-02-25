@@ -46,7 +46,7 @@ python main.py
 
 - 若已安装且版本匹配但内嵌登录仍空白，优先在登录弹窗查看 “WebEngine 诊断” 信息，并使用“系统浏览器登录当前平台 + 导入 Cookie 文件”继续使用。
 - Windows 下可尝试在启动前设置环境变量 `QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu` 以规避部分显卡驱动导致的空白页面问题。
-- 为避免部分 Windows 环境点击“平台登录”后进程异常退出，程序默认在 Windows 使用外部浏览器登录模式；如需强制启用内嵌页，可设置 `MORAN_FORCE_EMBEDDED_LOGIN=1` 后再启动。
+- 程序默认优先使用内嵌登录；若你的环境仍不稳定，可设置 `MORAN_SAFE_LOGIN_MODE=1`（或 `MORAN_DISABLE_EMBEDDED_LOGIN=1`）强制使用外部浏览器登录模式。
 
 ## PR 冲突处理建议
 
