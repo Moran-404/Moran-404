@@ -386,22 +386,10 @@ class ResolveWorker(QThread):
             "noplaylist": True,
         }
 
-        # 1) plain resolve first
-        stream_url = self._resolve_with_options(dict(base_options))
-        if stream_url:
-            self.finished.emit(stream_url)
-            return
+        # Prefer authenticated resolving first; otherwise yt-dlp may return preview urls.
+        tried: List[str] = []
 
-        # 2) cookie file resolve
-        if self.cookie_file and os.path.exists(self.cookie_file):
-            opts = dict(base_options)
-            opts["cookiefile"] = self.cookie_file
-            stream_url = self._resolve_with_options(opts)
-            if stream_url:
-                self.finished.emit(stream_url)
-                return
-
-        # 3) browser-cookie resolve (免导入)
+        # 1) browser-cookie resolve first (免导入)
         browsers = [self.browser_cookie_source] if self.browser_cookie_source else []
         for fallback in ["edge", "chrome", "firefox"]:
             if fallback not in browsers:
@@ -411,11 +399,30 @@ class ResolveWorker(QThread):
             opts = dict(base_options)
             opts["cookiesfrombrowser"] = (browser, None, None, None)
             stream_url = self._resolve_with_options(opts)
+            tried.append(f"browser:{browser}")
             if stream_url:
                 self.finished.emit(stream_url)
                 return
 
-        self.failed.emit("未解析到可播放音频地址（已尝试普通解析、Cookie 文件与浏览器登录态）")
+        # 2) cookie file resolve
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            opts = dict(base_options)
+            opts["cookiefile"] = self.cookie_file
+            stream_url = self._resolve_with_options(opts)
+            tried.append("cookie_file")
+            if stream_url:
+                self.finished.emit(stream_url)
+                return
+
+        # 3) plain resolve as last fallback
+        stream_url = self._resolve_with_options(dict(base_options))
+        tried.append("plain")
+        if stream_url:
+            self.finished.emit(stream_url)
+            return
+
+        tried_desc = " -> ".join(tried) if tried else "none"
+        self.failed.emit(f"未解析到可播放音频地址（已尝试：{tried_desc}）")
 
 
 class LoginDialog(QDialog):
