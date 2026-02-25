@@ -168,6 +168,37 @@ PLATFORMS = {
 }
 
 
+def probe_browser_login_state(platform: str, browser: str) -> tuple[bool, str]:
+    domain = PLATFORMS.get(platform, {}).get("domain", "")
+    if not domain:
+        return False, "未知平台，无法检测登录态"
+
+    options: Dict[str, Any] = {
+        "quiet": True,
+        "skip_download": True,
+        "cookiesfrombrowser": (browser, None, None, None),
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            cookiejar = getattr(ydl, "cookiejar", None)
+            if cookiejar is None:
+                return False, f"{browser} 浏览器 Cookie 读取失败"
+
+            matched = 0
+            total = 0
+            for cookie in cookiejar:
+                total += 1
+                if domain in (cookie.domain or ""):
+                    matched += 1
+
+            if matched > 0:
+                return True, f"已读取到 {matched} 条 {platform} 相关 Cookie（总计 {total} 条）"
+            return False, f"已读取浏览器 Cookie（总计 {total} 条），但未发现 {platform} 站点 Cookie"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"读取浏览器登录态失败：{exc}"
+
+
 @dataclass
 class TrackResult:
     platform: str
@@ -360,12 +391,17 @@ class SearchWorker(QThread):
 class ResolveWorker(QThread):
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
+    log = pyqtSignal(str)
 
     def __init__(self, track: TrackResult, cookie_file: Optional[str], browser_cookie_source: Optional[str]) -> None:
         super().__init__()
         self.track = track
         self.cookie_file = cookie_file
         self.browser_cookie_source = browser_cookie_source
+
+    def _emit_log(self, message: str) -> None:
+        print(f"[Moran Resolve] {message}", flush=True)
+        self.log.emit(message)
 
     def _resolve_with_options(self, options: Dict[str, Any]) -> Optional[str]:
         try:
@@ -390,6 +426,7 @@ class ResolveWorker(QThread):
         tried: List[str] = []
 
         # 1) browser-cookie resolve first (免导入)
+        self._emit_log("开始优先尝试浏览器登录态解析")
         browsers = [self.browser_cookie_source] if self.browser_cookie_source else []
         for fallback in ["edge", "chrome", "firefox"]:
             if fallback not in browsers:
@@ -401,27 +438,35 @@ class ResolveWorker(QThread):
             stream_url = self._resolve_with_options(opts)
             tried.append(f"browser:{browser}")
             if stream_url:
+                self._emit_log(f"浏览器登录态解析成功（{browser}）")
                 self.finished.emit(stream_url)
                 return
+            self._emit_log(f"浏览器登录态解析失败（{browser}）")
 
         # 2) cookie file resolve
         if self.cookie_file and os.path.exists(self.cookie_file):
+            self._emit_log("尝试使用 Cookie 文件解析")
             opts = dict(base_options)
             opts["cookiefile"] = self.cookie_file
             stream_url = self._resolve_with_options(opts)
             tried.append("cookie_file")
             if stream_url:
+                self._emit_log("Cookie 文件解析成功")
                 self.finished.emit(stream_url)
                 return
+            self._emit_log("Cookie 文件解析失败")
 
         # 3) plain resolve as last fallback
+        self._emit_log("尝试未登录普通解析")
         stream_url = self._resolve_with_options(dict(base_options))
         tried.append("plain")
         if stream_url:
+            self._emit_log("未登录普通解析成功（可能为试听流）")
             self.finished.emit(stream_url)
             return
 
         tried_desc = " -> ".join(tried) if tried else "none"
+        self._emit_log(f"所有解析方式失败：{tried_desc}")
         self.failed.emit(f"未解析到可播放音频地址（已尝试：{tried_desc}）")
 
 
@@ -490,11 +535,16 @@ class LoginDialog(QDialog):
 
         browser = "edge" if sys.platform.startswith("win") else "chrome"
         self.browser_cookie_selected.emit(target_platform, browser)
+
+        ok, msg = probe_browser_login_state(target_platform, browser)
+        print(f"[Moran Login] {target_platform} - {msg}", flush=True)
+        status_line = "登录态检测：已命中平台 Cookie，可尝试播放会员资源。" if ok else "登录态检测：尚未命中平台 Cookie，请先在浏览器完成登录再播放。"
+
         QMessageBox.information(
             self,
             "已启用",
             f"已打开 {target_platform} 登录页，并启用‘免导入浏览器登录态’。\n"
-            f"请在 {browser} 浏览器完成登录后直接回到播放器点击播放即可。",
+            f"{msg}\n{status_line}",
         )
 
 
@@ -750,9 +800,13 @@ class MusicPlayer(QMainWindow):
         self.resolve_worker = ResolveWorker(track, cookie_file, browser_cookie_source)
         self.resolve_worker.finished.connect(lambda url, t=track: self.on_stream_resolved(t, url))
         self.resolve_worker.failed.connect(self.on_worker_failed)
+        self.resolve_worker.log.connect(self.on_resolve_log)
         self.resolve_worker.finished.connect(lambda _: self.play_button.setEnabled(True))
         self.resolve_worker.failed.connect(lambda _: self.play_button.setEnabled(True))
         self.resolve_worker.start()
+
+    def on_resolve_log(self, message: str) -> None:
+        self.status.setText(f"状态：{message}")
 
     def on_stream_resolved(self, track: TrackResult, stream_url: str) -> None:
         self.current_track = track
