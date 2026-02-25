@@ -1,6 +1,8 @@
 import importlib
 import json
 import os
+import re
+import uuid
 import sys
 import tempfile
 from importlib.metadata import PackageNotFoundError, version
@@ -199,7 +201,16 @@ class SearchWorker(QThread):
             for key, value in headers.items():
                 req.add_header(key, value)
         with urlopen(req, timeout=12) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="ignore"))
+            text = resp.read().decode("utf-8", errors="ignore").strip()
+
+        if text.startswith("{") or text.startswith("["):
+            return json.loads(text)
+
+        match = re.search(r"\((\{.*\}|\[.*\])\)\s*$", text)
+        if match:
+            return json.loads(match.group(1))
+
+        return json.loads(text)
 
     def _search_netease(self) -> List[TrackResult]:
         payload = urlencode({"s": self.keyword, "type": "1", "offset": "0", "limit": "12"}).encode("utf-8")
@@ -227,29 +238,52 @@ class SearchWorker(QThread):
         return out
 
     def _search_kugou(self) -> List[TrackResult]:
-        url = f"https://mobilecdn.kugou.com/api/v3/search/song?format=json&keyword={quote_plus(self.keyword)}&page=1&pagesize=12"
-        data = self._read_json(url)
-        infos = data.get("data", {}).get("info", [])
+        # `songsearch.kugou.com` is generally more stable than mobilecdn in desktop environments.
+        url = (
+            "https://songsearch.kugou.com/song_search_v2?"
+            f"keyword={quote_plus(self.keyword)}&page=1&pagesize=12&platform=WebFilter"
+        )
+        data = self._read_json(url, headers={"Referer": "https://www.kugou.com/"})
+        infos = data.get("data", {}).get("lists", [])
         out: List[TrackResult] = []
         for song in infos[: self.PER_PLATFORM_LIMIT]:
-            song_id = song.get("hash")
+            song_hash = song.get("FileHash") or song.get("EMixSongID")
+            duration = song.get("Duration")
+            title = (song.get("SongName") or "未知标题").replace("<em>", "").replace("</em>", "")
+            artist = (song.get("SingerName") or "未知作者").replace("<em>", "").replace("</em>", "")
             out.append(
                 TrackResult(
                     platform="酷狗",
-                    title=song.get("songname") or "未知标题",
-                    artist=song.get("singername") or "未知作者",
-                    duration=self._seconds_to_text(song.get("duration")),
-                    webpage_url=f"https://www.kugou.com/song/#hash={song_id}",
+                    title=title,
+                    artist=artist,
+                    duration=self._seconds_to_text(duration),
+                    webpage_url=f"https://www.kugou.com/song/#hash={song_hash}",
                 )
             )
         return out
 
     def _search_kuwo(self) -> List[TrackResult]:
+        req = Request("https://www.kuwo.cn/", method="GET")
+        req.add_header("User-Agent", "Mozilla/5.0")
+        with urlopen(req, timeout=12) as resp:
+            cookie_header = resp.headers.get("Set-Cookie", "")
+
+        kw_token = ""
+        for part in cookie_header.split(";"):
+            if "kw_token=" in part:
+                kw_token = part.strip().split("kw_token=", 1)[-1]
+                break
+
+        headers = {"Referer": "https://www.kuwo.cn/", "csrf": kw_token}
+        if kw_token:
+            headers["Cookie"] = f"kw_token={kw_token}"
+
+        req_id = uuid.uuid4().hex
         url = (
             "https://www.kuwo.cn/api/www/search/searchMusicBykeyWord?"
-            f"key={quote_plus(self.keyword)}&pn=1&rn=12&httpsStatus=1&reqId="
+            f"key={quote_plus(self.keyword)}&pn=1&rn=12&httpsStatus=1&reqId={req_id}"
         )
-        data = self._read_json(url, headers={"Referer": "https://www.kuwo.cn/"})
+        data = self._read_json(url, headers=headers)
         songs = data.get("data", {}).get("list", [])
         out: List[TrackResult] = []
         for song in songs[: self.PER_PLATFORM_LIMIT]:
