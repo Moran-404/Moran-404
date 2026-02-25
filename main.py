@@ -178,6 +178,7 @@ class TrackResult:
 class SearchWorker(QThread):
     finished = pyqtSignal(list)
     failed = pyqtSignal(str)
+    PER_PLATFORM_LIMIT = 6
 
     def __init__(self, keyword: str, platforms: List[str]) -> None:
         super().__init__()
@@ -210,7 +211,7 @@ class SearchWorker(QThread):
         )
         songs = data.get("result", {}).get("songs", [])
         out: List[TrackResult] = []
-        for song in songs[:5]:
+        for song in songs[: self.PER_PLATFORM_LIMIT]:
             song_id = song.get("id")
             artists = song.get("ar") or song.get("artists") or []
             artist_text = "/".join(a.get("name", "") for a in artists if a.get("name")) or "未知作者"
@@ -230,7 +231,7 @@ class SearchWorker(QThread):
         data = self._read_json(url)
         infos = data.get("data", {}).get("info", [])
         out: List[TrackResult] = []
-        for song in infos[:5]:
+        for song in infos[: self.PER_PLATFORM_LIMIT]:
             song_id = song.get("hash")
             out.append(
                 TrackResult(
@@ -251,7 +252,7 @@ class SearchWorker(QThread):
         data = self._read_json(url, headers={"Referer": "https://www.kuwo.cn/"})
         songs = data.get("data", {}).get("list", [])
         out: List[TrackResult] = []
-        for song in songs[:5]:
+        for song in songs[: self.PER_PLATFORM_LIMIT]:
             rid = song.get("rid")
             duration_text = song.get("duration")
             out.append(
@@ -273,7 +274,7 @@ class SearchWorker(QThread):
         data = self._read_json(url)
         videos = data.get("data", {}).get("result", [])
         out: List[TrackResult] = []
-        for video in videos[:5]:
+        for video in videos[: self.PER_PLATFORM_LIMIT]:
             bvid = video.get("bvid")
             title = (video.get("title") or "未知标题").replace("<em class=\"keyword\">", "").replace("</em>", "")
             out.append(
@@ -288,7 +289,6 @@ class SearchWorker(QThread):
         return out
 
     def run(self) -> None:
-        merged: List[TrackResult] = []
         searchers = {
             "网易云": self._search_netease,
             "酷狗": self._search_kugou,
@@ -296,15 +296,25 @@ class SearchWorker(QThread):
             "Bilibili": self._search_bilibili,
         }
 
+        platform_results: Dict[str, List[TrackResult]] = {}
         errors: List[str] = []
         for platform in self.platforms:
             searcher = searchers.get(platform)
             if not searcher:
                 continue
             try:
-                merged.extend(searcher())
+                platform_results[platform] = searcher()
             except Exception as exc:  # noqa: BLE001
+                platform_results[platform] = []
                 errors.append(f"{platform}: {exc}")
+
+        merged: List[TrackResult] = []
+        max_len = max((len(items) for items in platform_results.values()), default=0)
+        for idx in range(max_len):
+            for platform in self.platforms:
+                items = platform_results.get(platform, [])
+                if idx < len(items):
+                    merged.append(items[idx])
 
         if not merged and errors:
             self.failed.emit("；".join(errors))
@@ -647,7 +657,11 @@ class MusicPlayer(QMainWindow):
             self.result_table.setItem(row, 2, QTableWidgetItem(track.artist))
             self.result_table.setItem(row, 3, QTableWidgetItem(track.duration))
             self.result_table.setItem(row, 4, QTableWidgetItem(track.webpage_url))
-        self.status.setText(f"状态：搜索完成，共 {len(results)} 条结果")
+        counts = {name: 0 for name in PLATFORMS}
+        for track in results:
+            counts[track.platform] = counts.get(track.platform, 0) + 1
+        detail = " / ".join(f"{k}:{v}" for k, v in counts.items() if v > 0)
+        self.status.setText(f"状态：搜索完成，共 {len(results)} 条结果" + (f"（{detail}）" if detail else ""))
 
     def on_worker_failed(self, message: str) -> None:
         QMessageBox.critical(self, "错误", message)
