@@ -43,6 +43,35 @@ WEBENGINE_FORCE_FALLBACK: bool = False
 WEBENGINE_RUNTIME_NOTES: List[str] = []
 
 
+class YtdlpSilentLogger:
+    def debug(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        pass
+
+    def error(self, msg: str) -> None:
+        pass
+
+
+def browser_candidates(preferred: Optional[str] = None) -> List[str]:
+    ordered: List[str] = []
+    if preferred:
+        ordered.append(preferred)
+
+    if sys.platform.startswith("win"):
+        defaults = ["edge", "chrome", "firefox"]
+    elif sys.platform == "darwin":
+        defaults = ["chrome", "safari", "firefox"]
+    else:
+        defaults = ["chrome", "firefox", "chromium"]
+
+    for name in defaults:
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
 def evaluate_webengine_environment() -> None:
     """Collect runtime diagnostics and decide whether embedded login should be disabled."""
     global WEBENGINE_IMPORT_ERROR, WEBENGINE_FORCE_FALLBACK
@@ -175,6 +204,8 @@ def probe_browser_login_state(platform: str, browser: str) -> tuple[bool, str]:
 
     options: Dict[str, Any] = {
         "quiet": True,
+        "no_warnings": True,
+        "logger": YtdlpSilentLogger(),
         "skip_download": True,
         "cookiesfrombrowser": (browser, None, None, None),
     }
@@ -417,6 +448,8 @@ class ResolveWorker(QThread):
     def run(self) -> None:
         base_options = {
             "quiet": True,
+            "no_warnings": True,
+            "logger": YtdlpSilentLogger(),
             "skip_download": True,
             "format": "bestaudio/best",
             "noplaylist": True,
@@ -427,10 +460,7 @@ class ResolveWorker(QThread):
 
         # 1) browser-cookie resolve first (免导入)
         self._emit_log("开始优先尝试浏览器登录态解析")
-        browsers = [self.browser_cookie_source] if self.browser_cookie_source else []
-        for fallback in ["edge", "chrome", "firefox"]:
-            if fallback not in browsers:
-                browsers.append(fallback)
+        browsers = browser_candidates(self.browser_cookie_source)
 
         for browser in browsers:
             opts = dict(base_options)
@@ -533,18 +563,32 @@ class LoginDialog(QDialog):
 
         self._open_url(conf["login_url"])
 
-        browser = "edge" if sys.platform.startswith("win") else "chrome"
-        self.browser_cookie_selected.emit(target_platform, browser)
+        checked_messages: List[str] = []
+        selected_browser = browser_candidates()[0]
+        ok = False
 
-        ok, msg = probe_browser_login_state(target_platform, browser)
-        print(f"[Moran Login] {target_platform} - {msg}", flush=True)
-        status_line = "登录态检测：已命中平台 Cookie，可尝试播放会员资源。" if ok else "登录态检测：尚未命中平台 Cookie，请先在浏览器完成登录再播放。"
+        for candidate in browser_candidates():
+            state_ok, msg = probe_browser_login_state(target_platform, candidate)
+            checked_messages.append(f"{candidate}: {msg}")
+            print(f"[Moran Login] {target_platform} - {candidate}: {msg}", flush=True)
+            if state_ok:
+                selected_browser = candidate
+                ok = True
+                break
 
+        self.browser_cookie_selected.emit(target_platform, selected_browser)
+        status_line = (
+            f"登录态检测：已命中平台 Cookie，后续优先使用 {selected_browser} 浏览器登录态解析。"
+            if ok
+            else "登录态检测：当前未命中平台 Cookie，请先在浏览器完成登录（必要时关闭浏览器后重试）。"
+        )
+
+        preview = "；".join(checked_messages[:2]) if checked_messages else "无"
         QMessageBox.information(
             self,
             "已启用",
             f"已打开 {target_platform} 登录页，并启用‘免导入浏览器登录态’。\n"
-            f"{msg}\n{status_line}",
+            f"{status_line}\n检测摘要：{preview}",
         )
 
 
