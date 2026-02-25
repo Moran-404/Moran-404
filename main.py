@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+from importlib.metadata import PackageNotFoundError, version
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus, urlencode
@@ -36,11 +37,46 @@ import yt_dlp
 
 
 WEBENGINE_IMPORT_ERROR: Optional[str] = None
+WEBENGINE_FORCE_FALLBACK: bool = False
+WEBENGINE_RUNTIME_NOTES: List[str] = []
+
+
+def evaluate_webengine_environment() -> None:
+    """Collect runtime diagnostics and decide whether embedded login should be disabled."""
+    global WEBENGINE_IMPORT_ERROR, WEBENGINE_FORCE_FALLBACK
+
+    notes: List[str] = []
+    try:
+        pyqt_ver = version("PyQt5")
+    except PackageNotFoundError:
+        pyqt_ver = "未安装"
+
+    try:
+        web_ver = version("PyQtWebEngine")
+    except PackageNotFoundError:
+        web_ver = "未安装"
+
+    notes.append(f"PyQt5={pyqt_ver}, PyQtWebEngine={web_ver}")
+
+    if pyqt_ver == "未安装" or web_ver == "未安装":
+        WEBENGINE_IMPORT_ERROR = "缺少 PyQt5 或 PyQtWebEngine 运行包"
+        WEBENGINE_FORCE_FALLBACK = True
+    elif pyqt_ver != web_ver:
+        WEBENGINE_IMPORT_ERROR = f"版本不匹配：PyQt5={pyqt_ver}, PyQtWebEngine={web_ver}"
+        WEBENGINE_FORCE_FALLBACK = True
+
+    if sys.maxsize <= 2**32:
+        notes.append("检测到 32 位 Python，WebEngine 稳定性可能较差")
+
+    WEBENGINE_RUNTIME_NOTES.clear()
+    WEBENGINE_RUNTIME_NOTES.extend(notes)
 
 
 def init_webengine_runtime() -> None:
     """Initialize QtWebEngine runtime before QApplication for better compatibility."""
     global WEBENGINE_IMPORT_ERROR
+
+    evaluate_webengine_environment()
 
     if sys.platform.startswith("win"):
         chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
@@ -66,6 +102,9 @@ def init_webengine_runtime() -> None:
     except Exception:  # noqa: BLE001
         pass
 
+    if WEBENGINE_FORCE_FALLBACK:
+        return
+
     try:
         importlib.import_module("PyQt5.QtWebEngineWidgets")
         WEBENGINE_IMPORT_ERROR = None
@@ -77,6 +116,8 @@ def init_webengine_runtime() -> None:
 
 def should_use_embedded_login() -> bool:
     """Prefer embedded login by default, with env-based escape hatches."""
+    if WEBENGINE_FORCE_FALLBACK:
+        return False
     if os.environ.get("MORAN_DISABLE_EMBEDDED_LOGIN") == "1":
         return False
     if os.environ.get("MORAN_SAFE_LOGIN_MODE") == "1":
@@ -89,6 +130,8 @@ def should_use_embedded_login() -> bool:
 def load_webengine_view_class() -> Optional[Any]:
     """Dynamically load QWebEngineView so app can run without PyQtWebEngine."""
     global WEBENGINE_IMPORT_ERROR
+    if WEBENGINE_FORCE_FALLBACK:
+        return None
     try:
         module = importlib.import_module("PyQt5.QtWebEngineWidgets")
     except Exception as exc:  # noqa: BLE001
@@ -315,6 +358,8 @@ class LoginDialog(QDialog):
         self.web_views: Dict[str, Any] = {}
         self.tab_pages: Dict[str, QWidget] = {}
         self.tip_label = QLabel("可优先在内嵌页登录；若页面异常，可点“系统浏览器登录当前平台”并导入 Cookie 文件。")
+        if WEBENGINE_RUNTIME_NOTES:
+            self.tip_label.setText(self.tip_label.text() + "\n环境：" + "；".join(WEBENGINE_RUNTIME_NOTES))
         if WEBENGINE_IMPORT_ERROR:
             self.tip_label.setText(self.tip_label.text() + f"\nWebEngine 诊断：{WEBENGINE_IMPORT_ERROR}")
 
@@ -472,6 +517,15 @@ class LoginDialog(QDialog):
         if self.webengine_view_class:
             self.tip_label.setText("已切换到内嵌登录模式，请在标签页中完成登录后导出 Cookie。")
             self.on_login_tab_changed(self.tabs.currentIndex())
+
+    def closeEvent(self, event: Any) -> None:
+        for view in self.web_views.values():
+            try:
+                view.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+        self.web_views.clear()
+        super().closeEvent(event)
 
     def _cache_cookie(self, platform: str, cookie: QNetworkCookie) -> None:
         target = self.cookie_cache[platform]

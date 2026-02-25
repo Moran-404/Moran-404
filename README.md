@@ -45,6 +45,7 @@ python main.py
 - 若未安装或无法正常使用 `PyQtWebEngine`，程序仍可运行，可在登录窗口中一键切换到“系统浏览器登录当前平台”并导入 Cookie 文件。
 
 - 若已安装且版本匹配但内嵌登录仍空白，优先在登录弹窗查看 “WebEngine 诊断” 信息，并使用“系统浏览器登录当前平台 + 导入 Cookie 文件”继续使用。
+- 程序启动时会自动检查 `PyQt5` 与 `PyQtWebEngine` 版本是否完全一致；若不一致会自动关闭内嵌登录并给出诊断信息，避免直接崩溃。
 - Windows 下可尝试在启动前设置环境变量 `QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --disable-gpu-compositing` 以规避部分显卡驱动导致的空白页面问题。
 - 若内嵌页能打开但几秒后闪退，可在启动前设置 `QT_OPENGL=software` 与 `QTWEBENGINE_DISABLE_SANDBOX=1`；本程序也会在 Windows 下默认注入这些兼容参数。
 - 登录弹窗已改为“单标签页单实例加载”策略（切换平台时再按需创建内嵌页），以减少多 WebEngine 同时初始化导致的崩溃风险。
