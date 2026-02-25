@@ -313,6 +313,7 @@ class LoginDialog(QDialog):
 
         self.tabs = QTabWidget(self)
         self.web_views: Dict[str, Any] = {}
+        self.tab_pages: Dict[str, QWidget] = {}
         self.tip_label = QLabel("可优先在内嵌页登录；若页面异常，可点“系统浏览器登录当前平台”并导入 Cookie 文件。")
         if WEBENGINE_IMPORT_ERROR:
             self.tip_label.setText(self.tip_label.text() + f"\nWebEngine 诊断：{WEBENGINE_IMPORT_ERROR}")
@@ -351,28 +352,17 @@ class LoginDialog(QDialog):
     def _build_embedded_tabs(self) -> None:
         try:
             self.web_views = {}
-            for idx, (platform, conf) in enumerate(PLATFORMS.items()):
-                view = self.webengine_view_class(self)
-                if hasattr(view, "settings"):
-                    settings = view.settings()
-                    web_attrs = [
-                        "JavascriptEnabled",
-                        "LocalStorageEnabled",
-                        "PluginsEnabled",
-                        "FullScreenSupportEnabled",
-                    ]
-                    for attr_name in web_attrs:
-                        if hasattr(settings, attr_name):
-                            settings.setAttribute(getattr(settings, attr_name), True)
+            self.tab_pages = {}
+            for platform in PLATFORMS:
+                page = QWidget(self)
+                page_layout = QVBoxLayout(page)
+                page_layout.setContentsMargins(0, 0, 0, 0)
+                page_layout.setSpacing(0)
+                page_layout.addWidget(QLabel("正在准备内嵌登录页..."))
+                self.tabs.addTab(page, platform)
+                self.tab_pages[platform] = page
 
-                target_url = conf["login_url"] if idx == 0 else "about:blank"
-                view.setUrl(QUrl(target_url))
-                self.tabs.addTab(view, platform)
-                self.web_views[platform] = view
-
-                store = view.page().profile().cookieStore()
-                store.cookieAdded.connect(lambda cookie, p=platform: self._cache_cookie(p, cookie))
-                store.loadAllCookies()
+            self.on_login_tab_changed(self.tabs.currentIndex())
         except Exception:  # noqa: BLE001
             self.tabs.clear()
             self.webengine_view_class = None
@@ -395,15 +385,58 @@ class LoginDialog(QDialog):
             page_layout.addStretch(1)
             self.tabs.addTab(page, platform)
 
+    def _clear_layout(self, layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def _create_embedded_view(self, platform: str) -> Any:
+        view = self.webengine_view_class(self)
+        if hasattr(view, "settings"):
+            settings = view.settings()
+            web_attrs = [
+                "JavascriptEnabled",
+                "LocalStorageEnabled",
+                "PluginsEnabled",
+                "FullScreenSupportEnabled",
+            ]
+            for attr_name in web_attrs:
+                if hasattr(settings, attr_name):
+                    settings.setAttribute(getattr(settings, attr_name), True)
+
+        store = view.page().profile().cookieStore()
+        store.cookieAdded.connect(lambda cookie, p=platform: self._cache_cookie(p, cookie))
+        return view
+
     def on_login_tab_changed(self, index: int) -> None:
         if index < 0 or not self.webengine_view_class:
             return
 
         platform = self.tabs.tabText(index)
-        view = self.web_views.get(platform)
         login_url = PLATFORMS.get(platform, {}).get("login_url")
-        if not view or not login_url:
+        page = self.tab_pages.get(platform)
+        if not page or not login_url:
             return
+
+        for key, old_view in list(self.web_views.items()):
+            if key == platform:
+                continue
+            old_page = self.tab_pages.get(key)
+            if old_page and old_page.layout():
+                self._clear_layout(old_page.layout())
+            old_view.deleteLater()
+            self.web_views.pop(key, None)
+
+        view = self.web_views.get(platform)
+        if not view:
+            view = self._create_embedded_view(platform)
+            self.web_views[platform] = view
+            page_layout = page.layout()
+            if page_layout:
+                self._clear_layout(page_layout)
+                page_layout.addWidget(view)
 
         current = view.url().toString()
         if current in ("", "about:blank"):
