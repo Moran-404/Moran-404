@@ -435,11 +435,41 @@ class ResolveWorker(QThread):
         print(f"[Moran Resolve] {message}", flush=True)
         self.log.emit(message)
 
+    @staticmethod
+    def _pick_stream_url(info: Dict[str, Any]) -> Optional[str]:
+        formats = info.get("formats") or []
+        candidates: List[Dict[str, Any]] = []
+        for fmt in formats:
+            url = fmt.get("url")
+            protocol = str(fmt.get("protocol") or "")
+            vcodec = str(fmt.get("vcodec") or "")
+            acodec = str(fmt.get("acodec") or "")
+            if not url:
+                continue
+            if protocol and "m3u8" in protocol:
+                continue
+            if protocol and protocol not in {"https", "http", "http_dash_segments"}:
+                continue
+            if vcodec not in {"none", ""}:
+                continue
+            if acodec in {"none", ""}:
+                continue
+            candidates.append(fmt)
+
+        if candidates:
+            candidates.sort(key=lambda x: (x.get("abr") or 0, x.get("tbr") or 0), reverse=True)
+            return candidates[0].get("url")
+
+        return info.get("url")
+
     def _resolve_with_options(self, options: Dict[str, Any]) -> Optional[str]:
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self.track.webpage_url, download=False)
-                stream_url = info.get("url") if info else None
+                if not info:
+                    return None
+
+                stream_url = self._pick_stream_url(info)
                 if stream_url:
                     return stream_url
         except Exception:  # noqa: BLE001
@@ -462,6 +492,7 @@ class ResolveWorker(QThread):
 
         # Prefer authenticated resolving first; otherwise yt-dlp may return preview urls.
         tried: List[str] = []
+        self._emit_log(f"正在解析页面：{self.track.webpage_url}")
 
         # 1) browser-cookie resolve first (免导入)
         self._emit_log("开始优先尝试浏览器登录态解析")
@@ -871,6 +902,7 @@ class MusicPlayer(QMainWindow):
 
     def on_stream_resolved(self, track: TrackResult, stream_url: str) -> None:
         self.current_track = track
+        print(f"[Moran Resolve] 最终播放流URL: {stream_url}", flush=True)
         self.player.setMedia(QMediaContent(QUrl(stream_url)))
         self.player.play()
         self.status.setText(f"状态：正在播放 {track.title}")
