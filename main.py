@@ -464,16 +464,40 @@ class ResolveWorker(QThread):
 
         return info.get("url"), (info.get("http_headers") or {})
 
+    @staticmethod
+    def _compose_cookie_header(cookiejar: Any, url: str) -> Optional[str]:
+        if not cookiejar or not url:
+            return None
+        try:
+            req = Request(url)
+            cookiejar.add_cookie_header(req)
+            return req.get_header("Cookie")
+        except Exception:  # noqa: BLE001
+            return None
+
     def _resolve_with_options(self, options: Dict[str, Any]) -> tuple[Optional[str], Dict[str, str]]:
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self.track.webpage_url, download=False)
                 if not info:
-                    return None
+                    return None, {}
 
                 stream_url, headers = self._pick_stream_url(info)
                 if stream_url:
-                    return stream_url, headers
+                    merged_headers = dict(headers or {})
+                    merged_headers.setdefault("Referer", self.track.webpage_url)
+                    merged_headers.setdefault(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                    )
+
+                    cookie_header = self._compose_cookie_header(getattr(ydl, "cookiejar", None), stream_url)
+                    if cookie_header:
+                        merged_headers.setdefault("Cookie", cookie_header)
+                        self._emit_log("已附加登录 Cookie 头用于播放请求")
+
+                    return stream_url, merged_headers
         except Exception:  # noqa: BLE001
             return None, {}
         return None, {}
@@ -907,6 +931,8 @@ class MusicPlayer(QMainWindow):
     def on_stream_resolved(self, track: TrackResult, stream_url: str, headers: Dict[str, str]) -> None:
         self.current_track = track
         print(f"[Moran Resolve] 最终播放流URL: {stream_url}", flush=True)
+        safe_headers = [k for k in (headers or {}).keys() if k.lower() != "cookie"]
+        print(f"[Moran Resolve] 播放请求头: {', '.join(safe_headers) if safe_headers else 'none'}", flush=True)
 
         request = QNetworkRequest(QUrl(stream_url))
         for key, value in (headers or {}).items():
