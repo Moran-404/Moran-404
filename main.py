@@ -423,6 +423,7 @@ class ResolveWorker(QThread):
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
     log = pyqtSignal(str)
+    SOCKET_TIMEOUT_S = 7
 
     def __init__(self, track: TrackResult, cookie_file: Optional[str], browser_cookie_source: Optional[str]) -> None:
         super().__init__()
@@ -453,6 +454,10 @@ class ResolveWorker(QThread):
             "skip_download": True,
             "format": "bestaudio/best",
             "noplaylist": True,
+            "socket_timeout": self.SOCKET_TIMEOUT_S,
+            "extractor_retries": 1,
+            "retries": 0,
+            "fragment_retries": 0,
         }
 
         # Prefer authenticated resolving first; otherwise yt-dlp may return preview urls.
@@ -461,7 +466,12 @@ class ResolveWorker(QThread):
         # 1) browser-cookie resolve first (免导入)
         self._emit_log("开始优先尝试浏览器登录态解析")
         browsers = browser_candidates(self.browser_cookie_source)
+        if not self.browser_cookie_source:
+            browsers = browsers[:2]
+        else:
+            browsers = browsers[:2]
 
+        self._emit_log("浏览器登录态候选：" + ", ".join(browsers))
         for browser in browsers:
             opts = dict(base_options)
             opts["cookiesfrombrowser"] = (browser, None, None, None)
@@ -603,6 +613,7 @@ class MusicPlayer(QMainWindow):
         self.cookie_files: Dict[str, str] = {}
         self.browser_cookie_sources: Dict[str, str] = {}
         self.current_track: Optional[TrackResult] = None
+        self.resolve_worker: Optional[ResolveWorker] = None
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -835,6 +846,10 @@ class MusicPlayer(QMainWindow):
         self.play_playlist_item(item)
 
     def play_playlist_item(self, item: QListWidgetItem) -> None:
+        if self.resolve_worker and self.resolve_worker.isRunning():
+            self.status.setText("状态：正在解析上一首，请稍候...")
+            return
+
         track = item.data(Qt.UserRole)
         cookie_file = self.cookie_files.get(track.platform)
         browser_cookie_source = self.browser_cookie_sources.get(track.platform)
@@ -847,6 +862,8 @@ class MusicPlayer(QMainWindow):
         self.resolve_worker.log.connect(self.on_resolve_log)
         self.resolve_worker.finished.connect(lambda _: self.play_button.setEnabled(True))
         self.resolve_worker.failed.connect(lambda _: self.play_button.setEnabled(True))
+        self.resolve_worker.finished.connect(lambda _: setattr(self, "resolve_worker", None))
+        self.resolve_worker.failed.connect(lambda _: setattr(self, "resolve_worker", None))
         self.resolve_worker.start()
 
     def on_resolve_log(self, message: str) -> None:
