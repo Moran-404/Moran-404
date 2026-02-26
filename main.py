@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
-from PyQt5.QtNetwork import QNetworkCookie
+from PyQt5.QtNetwork import QNetworkCookie, QNetworkRequest
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -420,7 +420,7 @@ class SearchWorker(QThread):
 
 
 class ResolveWorker(QThread):
-    finished = pyqtSignal(str)
+    finished = pyqtSignal(str, dict)
     failed = pyqtSignal(str)
     log = pyqtSignal(str)
     SOCKET_TIMEOUT_S = 7
@@ -436,7 +436,7 @@ class ResolveWorker(QThread):
         self.log.emit(message)
 
     @staticmethod
-    def _pick_stream_url(info: Dict[str, Any]) -> Optional[str]:
+    def _pick_stream_url(info: Dict[str, Any]) -> tuple[Optional[str], Dict[str, str]]:
         formats = info.get("formats") or []
         candidates: List[Dict[str, Any]] = []
         for fmt in formats:
@@ -458,23 +458,25 @@ class ResolveWorker(QThread):
 
         if candidates:
             candidates.sort(key=lambda x: (x.get("abr") or 0, x.get("tbr") or 0), reverse=True)
-            return candidates[0].get("url")
+            picked = candidates[0]
+            headers = picked.get("http_headers") or info.get("http_headers") or {}
+            return picked.get("url"), headers
 
-        return info.get("url")
+        return info.get("url"), (info.get("http_headers") or {})
 
-    def _resolve_with_options(self, options: Dict[str, Any]) -> Optional[str]:
+    def _resolve_with_options(self, options: Dict[str, Any]) -> tuple[Optional[str], Dict[str, str]]:
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self.track.webpage_url, download=False)
                 if not info:
                     return None
 
-                stream_url = self._pick_stream_url(info)
+                stream_url, headers = self._pick_stream_url(info)
                 if stream_url:
-                    return stream_url
+                    return stream_url, headers
         except Exception:  # noqa: BLE001
-            return None
-        return None
+            return None, {}
+        return None, {}
 
     def run(self) -> None:
         base_options = {
@@ -506,11 +508,11 @@ class ResolveWorker(QThread):
         for browser in browsers:
             opts = dict(base_options)
             opts["cookiesfrombrowser"] = (browser, None, None, None)
-            stream_url = self._resolve_with_options(opts)
+            stream_url, headers = self._resolve_with_options(opts)
             tried.append(f"browser:{browser}")
             if stream_url:
                 self._emit_log(f"浏览器登录态解析成功（{browser}）")
-                self.finished.emit(stream_url)
+                self.finished.emit(stream_url, headers)
                 return
             self._emit_log(f"浏览器登录态解析失败（{browser}）")
 
@@ -519,21 +521,21 @@ class ResolveWorker(QThread):
             self._emit_log("尝试使用 Cookie 文件解析")
             opts = dict(base_options)
             opts["cookiefile"] = self.cookie_file
-            stream_url = self._resolve_with_options(opts)
+            stream_url, headers = self._resolve_with_options(opts)
             tried.append("cookie_file")
             if stream_url:
                 self._emit_log("Cookie 文件解析成功")
-                self.finished.emit(stream_url)
+                self.finished.emit(stream_url, headers)
                 return
             self._emit_log("Cookie 文件解析失败")
 
         # 3) plain resolve as last fallback
         self._emit_log("尝试未登录普通解析")
-        stream_url = self._resolve_with_options(dict(base_options))
+        stream_url, headers = self._resolve_with_options(dict(base_options))
         tried.append("plain")
         if stream_url:
             self._emit_log("未登录普通解析成功（可能为试听流）")
-            self.finished.emit(stream_url)
+            self.finished.emit(stream_url, headers)
             return
 
         tried_desc = " -> ".join(tried) if tried else "none"
@@ -800,6 +802,8 @@ class MusicPlayer(QMainWindow):
         self.player.positionChanged.connect(self.progress.setValue)
         self.player.durationChanged.connect(lambda d: self.progress.setRange(0, d))
         self.player.stateChanged.connect(self.on_player_state_changed)
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.error.connect(self.on_player_error)
         self.progress.sliderMoved.connect(self.player.setPosition)
 
     def selected_platforms(self) -> List[str]:
@@ -888,22 +892,28 @@ class MusicPlayer(QMainWindow):
         self.play_button.setEnabled(False)
 
         self.resolve_worker = ResolveWorker(track, cookie_file, browser_cookie_source)
-        self.resolve_worker.finished.connect(lambda url, t=track: self.on_stream_resolved(t, url))
+        self.resolve_worker.finished.connect(lambda url, headers, t=track: self.on_stream_resolved(t, url, headers))
         self.resolve_worker.failed.connect(self.on_worker_failed)
         self.resolve_worker.log.connect(self.on_resolve_log)
-        self.resolve_worker.finished.connect(lambda _: self.play_button.setEnabled(True))
+        self.resolve_worker.finished.connect(lambda _url, _headers: self.play_button.setEnabled(True))
         self.resolve_worker.failed.connect(lambda _: self.play_button.setEnabled(True))
-        self.resolve_worker.finished.connect(lambda _: setattr(self, "resolve_worker", None))
+        self.resolve_worker.finished.connect(lambda _url, _headers: setattr(self, "resolve_worker", None))
         self.resolve_worker.failed.connect(lambda _: setattr(self, "resolve_worker", None))
         self.resolve_worker.start()
 
     def on_resolve_log(self, message: str) -> None:
         self.status.setText(f"状态：{message}")
 
-    def on_stream_resolved(self, track: TrackResult, stream_url: str) -> None:
+    def on_stream_resolved(self, track: TrackResult, stream_url: str, headers: Dict[str, str]) -> None:
         self.current_track = track
         print(f"[Moran Resolve] 最终播放流URL: {stream_url}", flush=True)
-        self.player.setMedia(QMediaContent(QUrl(stream_url)))
+
+        request = QNetworkRequest(QUrl(stream_url))
+        for key, value in (headers or {}).items():
+            if key and value:
+                request.setRawHeader(str(key).encode("utf-8"), str(value).encode("utf-8"))
+
+        self.player.setMedia(QMediaContent(request))
         self.player.play()
         self.status.setText(f"状态：正在播放 {track.title}")
 
@@ -924,6 +934,22 @@ class MusicPlayer(QMainWindow):
             self.pause_resume_button.setText("暂停")
         else:
             self.pause_resume_button.setText("播放")
+
+    def on_media_status_changed(self, status: int) -> None:
+        status_map = {
+            QMediaPlayer.LoadingMedia: "正在加载媒体...",
+            QMediaPlayer.BufferedMedia: "缓冲完成，准备播放",
+            QMediaPlayer.StalledMedia: "媒体缓冲停滞，正在重试...",
+            QMediaPlayer.InvalidMedia: "媒体无效，可能被防盗链或协议限制",
+            QMediaPlayer.EndOfMedia: "播放结束",
+        }
+        if status in status_map:
+            print(f"[Moran Player] {status_map[status]}", flush=True)
+
+    def on_player_error(self) -> None:
+        err = self.player.errorString() or "未知播放错误"
+        print(f"[Moran Player] 播放错误: {err}", flush=True)
+        self.status.setText(f"状态：播放失败 - {err}")
 
     def open_login_dialog(self) -> None:
         dialog = LoginDialog(self)
