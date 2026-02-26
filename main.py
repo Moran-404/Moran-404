@@ -439,6 +439,8 @@ class ResolveWorker(QThread):
     def _pick_stream_url(info: Dict[str, Any]) -> tuple[Optional[str], Dict[str, str]]:
         formats = info.get("formats") or []
         candidates: List[Dict[str, Any]] = []
+        preferred_ext_order = {"m4a": 0, "mp3": 1, "aac": 2, "mp4": 3, "opus": 4, "webm": 5, "flac": 6}
+
         for fmt in formats:
             url = fmt.get("url")
             protocol = str(fmt.get("protocol") or "")
@@ -457,7 +459,14 @@ class ResolveWorker(QThread):
             candidates.append(fmt)
 
         if candidates:
-            candidates.sort(key=lambda x: (x.get("abr") or 0, x.get("tbr") or 0), reverse=True)
+            def score(fmt: Dict[str, Any]) -> tuple[int, float, float]:
+                ext = str(fmt.get("ext") or "").lower()
+                ext_rank = preferred_ext_order.get(ext, 9)
+                abr = float(fmt.get("abr") or 0)
+                tbr = float(fmt.get("tbr") or 0)
+                return (-ext_rank, abr, tbr)
+
+            candidates.sort(key=score, reverse=True)
             picked = candidates[0]
             headers = picked.get("http_headers") or info.get("http_headers") or {}
             return picked.get("url"), headers
@@ -474,6 +483,27 @@ class ResolveWorker(QThread):
             return req.get_header("Cookie")
         except Exception:  # noqa: BLE001
             return None
+
+    @staticmethod
+    def _sanitize_request_headers(headers: Dict[str, str]) -> Dict[str, str]:
+        allow_list = {
+            "user-agent",
+            "referer",
+            "origin",
+            "cookie",
+            "accept",
+            "accept-language",
+            "range",
+        }
+        cleaned: Dict[str, str] = {}
+        for key, value in (headers or {}).items():
+            if not key or value is None:
+                continue
+            key_lower = str(key).lower().strip()
+            if key_lower not in allow_list:
+                continue
+            cleaned[key] = str(value)
+        return cleaned
 
     def _resolve_with_options(self, options: Dict[str, Any]) -> tuple[Optional[str], Dict[str, str]]:
         try:
@@ -494,9 +524,10 @@ class ResolveWorker(QThread):
 
                     cookie_header = self._compose_cookie_header(getattr(ydl, "cookiejar", None), stream_url)
                     if cookie_header:
-                        merged_headers.setdefault("Cookie", cookie_header)
+                        merged_headers["Cookie"] = cookie_header
                         self._emit_log("已附加登录 Cookie 头用于播放请求")
 
+                    merged_headers = self._sanitize_request_headers(merged_headers)
                     return stream_url, merged_headers
         except Exception:  # noqa: BLE001
             return None, {}
